@@ -27,7 +27,7 @@ func TestDatabaseSQLCRUD(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	db, err := sql.Open("as400", databaseSQLCRUDTestDSN())
+	db, err := sql.Open("i400", databaseSQLCRUDTestDSN())
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)
 	}

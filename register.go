@@ -5,5 +5,5 @@ import "database/sql"
 var driverInstance = &Driver{}
 
 func init() {
-	sql.Register("as400", driverInstance)
+	sql.Register("i400", driverInstance)
 }
