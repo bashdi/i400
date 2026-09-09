@@ -1,3 +1,78 @@
+# Usage
+
+```go
+package main
+
+import (
+	"database/sql"
+	"log"
+
+	_ "github.com/bashdi/i400"
+)
+
+func main() {
+	db, err := sql.Open("i400", "as400://USER:PASSWORD@ibmi.example.com:8471/MYLIB")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+`as400s://` can be used for a TLS connection.
+
+## DSN format
+
+The DSN has the following format:
+
+```text
+SCHEME://USER:PASSWORD@HOST[:PORT][/LIBRARY][?OPTION=VALUE]
+```
+
+Required:
+
+- `SCHEME`: `as400` for an unencrypted connection or `as400s` for TLS.
+- `HOST`: Hostname or IP address of the IBM i system.
+
+Optional:
+
+- `USER:PASSWORD`: Credentials. They are optional during DSN parsing, but the server must authenticate the connection successfully.
+- `PORT`: IBM i database service port. Defaults to `8471` for `as400` and `9471` for `as400s`. The query parameters `port` and `portNumber` are also accepted.
+- `/LIBRARY`: Default library/schema. If omitted, no schema is configured.
+- `?OPTION=VALUE`: Optional driver settings described below.
+
+Usernames, passwords, and library names must be URL-encoded when they contain characters such as `@`, `:`, or spaces.
+
+### DSN options
+
+All options are optional. Boolean values use `true` or `false`.
+
+| Option | Values / format | Default | Description |
+| --- | --- | --- | --- |
+| `tls` / `secure` | `true`, `false` | Based on the scheme | Enables or disables TLS. These options override the scheme setting. |
+| `naming` | `sql`, `system` | `sql` | Selects SQL naming or IBM i system naming. |
+| `libraries` | Comma-separated library names | Empty | Adds libraries to the connection's library list. |
+| `connectTimeout` / `timeout` | Go duration such as `5s`, or a number of seconds | `15s` | Maximum time allowed when opening the connection. |
+| `statementCacheSize` | Non-negative integer | `0` | Number of prepared statements cached per connection. `0` disables statement caching. |
+| `scrollableCursors` | `true`, `false` | `false` | Enables the driver's scrollable cursor extension. |
+| `holdCursors` | `true`, `false` | `false` | Requests cursors that remain open across commits where supported by IBM i. |
+| `dateFormat` | `julian`, `mdy`, `dmy`, `ymd`, `usa`, `iso`, `eur`, `jis`, or `0`-`7` | `iso` | Date format used by the server. |
+| `dateSeparator` | `slash`, `dash`, `dot`, `comma`, `space`, or `0`-`4` | `slash` | Date separator used by the server. |
+| `timeFormat` | `hms`, `usa`, `iso`, `eur`, `jis`, or `0`-`4` | `hms` | Time format used by the server. |
+| `timeSeparator` | `colon`, `dot`, `comma`, `space`, or `0`-`3` | `colon` | Time separator used by the server. |
+| `decimalSeparator` | `dot`, `comma`, `0`, or `1` | `dot` | Decimal separator used by the server. |
+| `commitmentControl` / `commitControl` | `none`, `cs`, `chg`, `all`, `rr`, or `0`-`4` | `cs` | Sets the commitment-control level: cursor stability, changed page, all, or repeatable read. |
+
+For example:
+
+```text
+as400://USER:PASSWORD@ibmi.example.com/MYLIB?naming=sql&libraries=APPDATA,APPLIB&connectTimeout=10s&statementCacheSize=20
+```
+
 # i400 Capability Matrix
 
 
