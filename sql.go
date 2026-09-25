@@ -2452,16 +2452,7 @@ func decodeTextByCCSID(data []byte, ccsid int) (string, error) {
 	if len(data) == 0 {
 		return "", nil
 	}
-	switch ccsid {
-	case 0, 37, 273, 65535:
-		return DecodeEBCDIC37(data)
-	case 1200, 13488:
-		return DecodeUTF16BE(data)
-	case 1208:
-		return string(data), nil
-	default:
-		return "", fmt.Errorf("%w: unsupported CCSID %d", ErrUnsupported, ccsid)
-	}
+	return decodeCCSID(data, ccsid)
 }
 
 // decfloatUnpackDeclet decodes a 10-bit Densely Packed Decimal (DPD) declet
@@ -3577,16 +3568,7 @@ func encodeFixedTextBytes(text string, field parameterMarkerField) ([]byte, erro
 }
 
 func encodeTextBytes(text string, ccsid int) ([]byte, error) {
-	switch ccsid {
-	case 0, 37, 273, 65535:
-		return EncodeEBCDIC37(text)
-	case 1200, 13488:
-		return EncodeUTF16BE(text), nil
-	case 1208:
-		return []byte(text), nil
-	default:
-		return nil, fmt.Errorf("%w: unsupported CCSID %d", ErrUnsupported, ccsid)
-	}
+	return encodeCCSID(text, ccsid)
 }
 
 func fitTextBytesToLength(raw []byte, length int, ccsid int) []byte {

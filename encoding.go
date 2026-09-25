@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"unicode/utf16"
 
+	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
 )
 
@@ -34,6 +35,74 @@ func EncodeEBCDIC37(text string) ([]byte, error) {
 		return nil, err
 	}
 	return encoded, nil
+}
+
+func encodingForCCSID(ccsid int) (encoding.Encoding, bool) {
+	switch ccsid {
+	case 0, 37, 273, 277, 278, 280, 284, 285, 297, 500, 65535:
+		return charmap.CodePage037, true
+	case 437:
+		return charmap.CodePage437, true
+	case 819:
+		return charmap.ISO8859_1, true
+	case 850:
+		return charmap.CodePage850, true
+	case 858:
+		return charmap.CodePage858, true
+	case 912:
+		return charmap.ISO8859_2, true
+	case 1026:
+		return charmap.CodePage037, true
+	case 1141:
+		return charmap.CodePage1140, true
+	case 1252:
+		return charmap.Windows1252, true
+	case 930, 933, 935, 937, 939:
+		// x/text does not provide IBM's mixed single-/double-byte tables.
+		// The invariant EBCDIC single-byte portion is still usable for
+		// protocol text that contains no national DBCS characters.
+		return charmap.CodePage037, true
+	case 1047:
+		return charmap.CodePage1047, true
+	case 1140:
+		return charmap.CodePage1140, true
+	case 1200, 13488, 1208:
+		return nil, true
+	default:
+		return nil, false
+	}
+}
+
+func encodeCCSID(text string, ccsid int) ([]byte, error) {
+	switch ccsid {
+	case 1200, 13488:
+		return EncodeUTF16BE(text), nil
+	case 1208:
+		return []byte(text), nil
+	}
+	codec, ok := encodingForCCSID(ccsid)
+	if !ok {
+		return nil, fmt.Errorf("%w: unsupported CCSID %d", ErrUnsupported, ccsid)
+	}
+	return codec.NewEncoder().Bytes([]byte(text))
+}
+
+func decodeCCSID(data []byte, ccsid int) (string, error) {
+	switch ccsid {
+	case 1200, 13488:
+		return DecodeUTF16BE(data)
+	case 1208:
+		return string(data), nil
+	}
+	codec, ok := encodingForCCSID(ccsid)
+	if !ok {
+		return "", fmt.Errorf("%w: unsupported CCSID %d", ErrUnsupported, ccsid)
+	}
+	decoded, err := codec.NewDecoder().Bytes(data)
+	if err != nil {
+		return "", err
+	}
+	return string(decoded), nil
 }
 
 func DecodeEBCDIC37(data []byte) (string, error) {

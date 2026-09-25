@@ -153,7 +153,7 @@ as400://USER:PASSWORD@ibmi.example.com/MYLIB?naming=sql&libraries=APPDATA,APPLIB
 - DATE/TIME/TIMESTAMP columns decoded to `time.Time` (IBM i timestamp format including variable fractional-second precision).
 - DECFLOAT(16) and DECFLOAT(34) decoded from IEEE 754 DPD binary to decimal string.
 - SQLSTATE class sentinel errors (`ErrSQLNoData`, `ErrSQLDataException`, `ErrSQLConstraintViolation`, `ErrSQLInvalidCursor`, `ErrSQLSyntaxError`) for `errors.Is` matching.
-- Explicit CCSID handling: 37 (EBCDIC), 273 (treated as EBCDIC-37), 1200/13488 (UTF-16BE), 1208 (UTF-8); CCSIDs 0 and 65535 remapped to 37.
+- Explicit CCSID handling includes the requested EBCDIC, ASCII-compatible, ISO-8859, Windows-1252, UTF-8, and UTF-16BE CCSIDs; CCSIDs 0 and 65535 use the default EBCDIC-37 mapping.
 - All optional `RowsColumnType*` interfaces: `DatabaseTypeName`, `ScanType`, `Nullable`, `Length`, `PrecisionScale`.
 - `ColumnTypeLength` reports the positive server-provided LOB maximum for LOB and LOB-locator columns, falling back to the declared column length; unknown or non-positive sizes report `ok=false`.
 - `ColumnTypePrecisionScale` reports DECIMAL/NUMERIC and DECFLOAT precision and scale from server metadata.
