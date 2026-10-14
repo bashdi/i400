@@ -110,6 +110,11 @@ const (
 	CodePointUseExtendedFormats      = 0x00F1
 	CodePointUseSuperExtendedFormats = 0x00F2
 	CodePointTrueAutoCommitIndicator = 0x3824
+	CodePointLOBFieldThreshold       = 0x3822
+	CodePointDecimalPrecision        = 0x3827
+	CodePointQueryOptimizeGoal       = 0x3833
+	CodePointDecfloatRoundingMode    = 0x3835
+	CodePointCloseOnEOF              = 0x383F
 
 	CodePointMessageID                    = 0x3801
 	CodePointFirstLevelMessageText        = 0x3802

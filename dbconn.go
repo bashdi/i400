@@ -119,20 +119,7 @@ func databaseExchangeSeeds(conn net.Conn, clientSeed []byte) ([]byte, error) {
 }
 
 func databaseStartServer(conn net.Conn, info *SystemInfo, user, password string, clientSeed, serverSeed []byte) error {
-	userBytesForEncryption, err := signonUserBytes(user, info.PasswordLevel, true)
-	if err != nil {
-		return err
-	}
-	passwordBytes, err := signonPasswordBytes(password, info.PasswordLevel)
-	if err != nil {
-		return err
-	}
-	var encryptedPassword []byte
-	if info.PasswordLevel >= 2 {
-		encryptedPassword, err = encryptPasswordSHA(userBytesForEncryption, passwordBytes, clientSeed, serverSeed)
-	} else {
-		encryptedPassword, err = encryptPasswordDES(userBytesForEncryption, passwordBytes, clientSeed, serverSeed)
-	}
+	encryptedPassword, err := passwordSubstitute(user, password, info.PasswordLevel, clientSeed, serverSeed)
 	if err != nil {
 		return err
 	}
@@ -151,11 +138,7 @@ func databaseStartServer(conn net.Conn, info *SystemInfo, user, password string,
 	request = appendU32(request, 0)
 	request = appendU16(request, 2)
 	request = appendU16(request, RequestStartServer)
-	if len(encryptedPassword) == 8 {
-		request = append(request, 1)
-	} else {
-		request = append(request, 3)
-	}
+	request = append(request, passwordAuthScheme(len(encryptedPassword)))
 	request = append(request, 1)
 	request = appendU32(request, uint32(6+len(encryptedPassword)))
 	request = appendU16(request, CodePointPassword)
@@ -196,7 +179,11 @@ func databaseStartServer(conn net.Conn, info *SystemInfo, user, password string,
 }
 
 func databaseSetServerAttributes(conn net.Conn, cfg Config, info *SystemInfo, autoCommit bool) (string, error) {
-	request, err := buildSetServerAttributesRequest(cfg, autoCommit, cfg.CommitmentControl)
+	serverVRM := 0
+	if info != nil {
+		serverVRM = info.ServerVersion
+	}
+	request, err := buildSetServerAttributesRequestVRM(cfg, autoCommit, cfg.CommitmentControl, serverVRM)
 	if err != nil {
 		return "", err
 	}
@@ -286,7 +273,17 @@ func databaseAddLibraryList(conn net.Conn, cfg Config) error {
 	return nil
 }
 
+// closeOnEOFMinVRM is V6R1M0 in JTOpen's VRM encoding ((V<<16)|(R<<8)|M).
+const closeOnEOFMinVRM = 0x060100
+
 func buildSetServerAttributesRequest(cfg Config, autoCommit bool, commitmentControl int) ([]byte, error) {
+	return buildSetServerAttributesRequestVRM(cfg, autoCommit, commitmentControl, 0)
+}
+
+// buildSetServerAttributesRequestVRM builds the set-server-attributes request.
+// serverVRM is the server version in VRM form, taken from the signon exchange;
+// zero means unknown, in which case the close-on-EOF attribute is omitted.
+func buildSetServerAttributesRequestVRM(cfg Config, autoCommit bool, commitmentControl int, serverVRM int) ([]byte, error) {
 	body := make([]byte, 0, 256)
 	parmCount := 0
 
@@ -300,11 +297,13 @@ func buildSetServerAttributesRequest(cfg Config, autoCommit bool, commitmentCont
 	parmCount++
 	body = appendShortAttribute(body, CodePointNamingConvention, namingConventionValue(cfg.Naming))
 	parmCount++
-	body = appendShortAttribute(body, CodePointCommitmentControlLevel, requestCommitmentControl(autoCommit, commitmentControl))
+	body = appendShortAttribute(body, CodePointCommitmentControlLevel, serverCommitmentControl(cfg, autoCommit, commitmentControl))
 	parmCount++
 	body = appendByteAttribute(body, CodePointTrueAutoCommitIndicator, autoCommitIndicator(autoCommit))
 	parmCount++
 	body = appendByteAttribute(body, 0x3821, 0xF2)
+	parmCount++
+	body = append(body, buildSetPackageAddAttribute(cfg)...)
 	parmCount++
 	body = appendShortAttribute(body, CodePointDateFormat, uint16(cfg.DateFormat))
 	parmCount++
@@ -316,8 +315,33 @@ func buildSetServerAttributesRequest(cfg Config, autoCommit bool, commitmentCont
 	parmCount++
 	body = appendShortAttribute(body, CodePointDecimalSeparator, uint16(cfg.DecimalSeparator))
 	parmCount++
-	body = appendIntAttribute(body, 0x3822, 1024*1024)
+	// Decimal precision/scale indicators (JTOpen sends these for V5R3 and later).
+	body = appendRawAttribute(body, CodePointDecimalPrecision, decimalPrecisionIndicators(cfg))
 	parmCount++
+	body = appendIntAttribute(body, CodePointLOBFieldThreshold, cfg.lobThresholdValue())
+	parmCount++
+	// Like JTOpen, these are only sent when they differ from the server default.
+	if goal := queryOptimizeGoalValue(cfg.QueryOptimizeGoal); goal != 0 {
+		body = appendByteAttribute(body, CodePointQueryOptimizeGoal, goal)
+		parmCount++
+	}
+	if cfg.DecfloatRoundingMode != 0 {
+		body = appendShortAttribute(body, CodePointDecfloatRoundingMode, uint16(cfg.DecfloatRoundingMode))
+		parmCount++
+	}
+	// Close-on-EOF (JTOpen sends it for V6R1 and later): the server closes a
+	// forward-only cursor once its last row has been returned, so the driver
+	// does not need a separate close request for it.
+	if serverVRM >= closeOnEOFMinVRM {
+		body = appendByteAttribute(body, CodePointCloseOnEOF, 0xE8)
+		parmCount++
+	}
+	// Client info (DSN values) and query storage limit, V6R1 and later (clientinfo.go).
+	body, optionCount, err := appendVRMOptionAttributes(body, cfg, serverVRM)
+	if err != nil {
+		return nil, err
+	}
+	parmCount += optionCount
 	body = appendByteAttribute(body, 0x3805, 0xF0)
 	parmCount++
 	body = appendShortAttribute(body, 0x3806, 1)
@@ -352,6 +376,46 @@ func buildSetServerAttributesRequest(cfg Config, autoCommit bool, commitmentCont
 	request := buildHeader(uint32(40+len(body)), 0, DatabaseServerID, 20, FunctionSetAttributes)
 	request = appendRequestTemplate(request, orsSendReplyImmediately|0x01000000, 0, 0, parmCount)
 	return append(request, body...), nil
+}
+
+// decimalPrecisionIndicators builds the 6-byte 0x3827 value: maximum precision,
+// maximum scale and minimum divide scale, each as a big-endian 16-bit integer.
+// As in JTOpen, a maximum scale above 31 forces the precision to 63.
+func decimalPrecisionIndicators(cfg Config) []byte {
+	precision := cfg.DecimalMaxPrecision
+	if precision != 63 {
+		precision = defaultDecimalMaxPrecision
+	}
+	if cfg.DecimalMaxScale > 31 {
+		precision = 63
+	}
+	value := make([]byte, 6)
+	binary.BigEndian.PutUint16(value[0:2], uint16(precision))
+	binary.BigEndian.PutUint16(value[2:4], uint16(cfg.DecimalMaxScale))
+	binary.BigEndian.PutUint16(value[4:6], uint16(cfg.MinimumDivideScale))
+	return value
+}
+
+// queryOptimizeGoalValue maps the DSN option to the 0x3833 byte: 1 (*FIRSTIO)
+// becomes 0xC6 and 2 (*ALLIO) becomes 0xC1. Zero means the server default.
+func queryOptimizeGoalValue(goal int) byte {
+	switch goal {
+	case 1:
+		return 0xC6
+	case 2:
+		return 0xC1
+	}
+	return 0
+}
+
+// serverCommitmentControl returns the commitment control level for the set
+// attributes request. With autocommit on and TrueAutocommit off, the level is
+// *NONE (0), as before. With TrueAutocommit on, the configured level is kept.
+func serverCommitmentControl(cfg Config, autoCommit bool, commitmentControl int) uint16 {
+	if autoCommit && !cfg.TrueAutocommit {
+		return 0
+	}
+	return requestCommitmentControl(false, commitmentControl)
 }
 
 func buildAddLibraryListRequest(cfg Config) ([]byte, bool, error) {
@@ -390,6 +454,12 @@ func appendEBCDIC37StringAttribute(dst []byte, codePoint uint16, value string) (
 	dst = appendU16(dst, 37)
 	dst = appendU16(dst, uint16(len(encoded)))
 	return appendBytes(dst, encoded), nil
+}
+
+func appendRawAttribute(dst []byte, codePoint uint16, value []byte) []byte {
+	dst = appendU32(dst, uint32(6+len(value)))
+	dst = appendU16(dst, codePoint)
+	return appendBytes(dst, value)
 }
 
 func appendEBCDIC37FixedAttribute(dst []byte, codePoint uint16, value string, size int) ([]byte, error) {

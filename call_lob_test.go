@@ -131,8 +131,8 @@ func TestConnExecContextCallSetsOutParameter(t *testing.T) {
 			t.Errorf("parse close header: %v", err)
 			return
 		}
-		if header.ReqRepID != FunctionClose {
-			t.Errorf("close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionClose)
+		if header.ReqRepID != FunctionDeleteRPB {
+			t.Errorf("close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionDeleteRPB)
 			return
 		}
 		if _, err := server.Write(buildTestReplyPacket(nil)); err != nil {
@@ -313,8 +313,8 @@ func TestStmtExecContextWritesBlobLocatorData(t *testing.T) {
 			t.Errorf("parse close header: %v", err)
 			return
 		}
-		if header.ReqRepID != FunctionClose {
-			t.Errorf("close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionClose)
+		if header.ReqRepID != FunctionDeleteRPB {
+			t.Errorf("close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionDeleteRPB)
 			return
 		}
 		if _, err := server.Write(buildTestReplyPacket(nil)); err != nil {

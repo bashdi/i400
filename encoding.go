@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"unicode/utf16"
 
-	"golang.org/x/text/encoding/charmap"
+	"github.com/bashdi/i400/internal/ccsid"
 )
 
 func EncodeUTF16BE(text string) []byte {
@@ -29,19 +29,11 @@ func DecodeUTF16BE(data []byte) (string, error) {
 }
 
 func EncodeEBCDIC37(text string) ([]byte, error) {
-	encoded, err := charmap.CodePage037.NewEncoder().Bytes([]byte(text))
-	if err != nil {
-		return nil, err
-	}
-	return encoded, nil
+	return ccsid.Encode(text, 37)
 }
 
 func DecodeEBCDIC37(data []byte) (string, error) {
-	decoded, err := charmap.CodePage037.NewDecoder().Bytes(data)
-	if err != nil {
-		return "", err
-	}
-	return string(decoded), nil
+	return ccsid.Decode(data, 37)
 }
 
 func EncodeEBCDIC37BlankPad(text string, size int) ([]byte, error) {

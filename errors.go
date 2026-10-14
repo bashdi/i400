@@ -3,6 +3,7 @@ package i400
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 var (
@@ -25,10 +26,21 @@ var (
 	ErrSQLSyntaxError         = errors.New("as400: syntax error or access violation (SQLSTATE 42xxx)")
 )
 
+// SQLError is an error reported by the server in the SQLCA.
+//
+// Message holds the first-level message text when the server returned one,
+// otherwise a summary built from the SQLSTATE. MessageID (for example SQL0204),
+// MessageText and SecondLevelText carry the server message as JTOpen exposes it;
+// SecondLevelText is only requested when the DSN sets errors=full. Tokens holds
+// the SQLERRMC substitution values from the SQLCA.
 type SQLError struct {
-	Code    int
-	State   string
-	Message string
+	Code            int
+	State           string
+	Message         string
+	MessageID       string
+	MessageText     string
+	SecondLevelText string
+	Tokens          string
 }
 
 // ProtocolError describes an error returned by the IBM i host-server
@@ -99,6 +111,22 @@ func newProtocolError(operation string, envelope replyEnvelope) error {
 	return &ProtocolError{Operation: operation, Class: envelope.RCClass, Code: envelope.RCCode}
 }
 
+// recordDeleteDescriptorFailure records a failed descriptor cleanup as a
+// connection warning. Cleanup runs after the statement has already produced its
+// result, so the failure must not replace that result; the warning is visible
+// through Conn.Warnings instead.
+func (c *Conn) recordDeleteDescriptorFailure(err error, envelope replyEnvelope) {
+	switch {
+	case err != nil:
+		c.recordWarning(&SQLWarning{Message: fmt.Sprintf("delete descriptor request failed: %v", err)})
+	case envelope.hasError():
+		c.recordWarning(&SQLWarning{
+			Code:    envelope.RCCode,
+			Message: fmt.Sprintf("delete descriptor request failed: class=%d code=0x%x", envelope.RCClass, uint32(envelope.RCCode)),
+		})
+	}
+}
+
 func newWireError(operation string, err error) error {
 	if err == nil {
 		return nil
@@ -129,6 +157,27 @@ func cloneSQLWarningChain(head *SQLWarning) *SQLWarning {
 func (e *SQLError) Error() string {
 	if e == nil {
 		return "<nil>"
+	}
+	if e.MessageID != "" || e.MessageText != "" {
+		// JTOpen style: "[SQL0204] text second-level (SQLSTATE 42704, SQLCODE -204)".
+		var b strings.Builder
+		if e.MessageID != "" {
+			b.WriteString("[" + e.MessageID + "] ")
+		}
+		text := e.MessageText
+		if text == "" {
+			text = e.Message
+		}
+		b.WriteString(text)
+		if e.SecondLevelText != "" {
+			b.WriteString(" " + e.SecondLevelText)
+		}
+		if e.State != "" {
+			fmt.Fprintf(&b, " (SQLSTATE %s, SQLCODE %d)", e.State, e.Code)
+		} else {
+			fmt.Fprintf(&b, " (SQLCODE %d)", e.Code)
+		}
+		return b.String()
 	}
 	if e.State == "" {
 		return fmt.Sprintf("as400 sql error %d: %s", e.Code, e.Message)

@@ -126,21 +126,7 @@ func signonExchange(conn net.Conn, system string) (*SystemInfo, []byte, []byte, 
 }
 
 func signonAuthenticate(conn net.Conn, info *SystemInfo, user, password string, clientSeed, serverSeed []byte) error {
-	userBytesForEncryption, err := signonUserBytes(user, info.PasswordLevel, true)
-	if err != nil {
-		return err
-	}
-	passwordBytes, err := signonPasswordBytes(password, info.PasswordLevel)
-	if err != nil {
-		return err
-	}
-
-	var encryptedPassword []byte
-	if info.PasswordLevel >= 2 {
-		encryptedPassword, err = encryptPasswordSHA(userBytesForEncryption, passwordBytes, clientSeed, serverSeed)
-	} else {
-		encryptedPassword, err = encryptPasswordDES(userBytesForEncryption, passwordBytes, clientSeed, serverSeed)
-	}
+	encryptedPassword, err := passwordSubstitute(user, password, info.PasswordLevel, clientSeed, serverSeed)
 	if err != nil {
 		return err
 	}
@@ -155,11 +141,7 @@ func signonAuthenticate(conn net.Conn, info *SystemInfo, user, password string, 
 		length += 7
 	}
 	request := buildHeader(uint32(length), 0, SignonServerID, 1, RequestSignonInfo)
-	authType := byte(3)
-	if len(encryptedPassword) == 8 {
-		authType = 1
-	}
-	request = append(request, authType)
+	request = append(request, passwordAuthScheme(len(encryptedPassword)))
 	request = appendU32(request, 10)
 	request = appendU16(request, CodePointClientCCSID)
 	request = appendU32(request, clientCCSID)
@@ -208,7 +190,7 @@ func signonError(rc int32) error {
 	case 0x20001:
 		return fmt.Errorf("%w: user ID is not known", ErrAuthentication)
 	case 0x3000B:
-		return fmt.Errorf("%w: password is incorrect", ErrAuthentication)
+		return fmt.Errorf("%w: signon rejected by server (return code 0x3000B); the password may be incorrect", ErrAuthentication)
 	case 0x3000C:
 		return fmt.Errorf("%w: user profile will be revoked on next invalid password or passphrase", ErrAuthentication)
 	case 0x3000D:
@@ -226,17 +208,4 @@ func signonUserBytes(user string, level int, forEncryption bool) ([]byte, error)
 		return nil, fmt.Errorf("user too long")
 	}
 	return EncodeEBCDIC37BlankPad(strings.ToUpper(user), 10)
-}
-
-func signonPasswordBytes(password string, level int) ([]byte, error) {
-	if level >= 2 {
-		return EncodeUTF16BEString(password), nil
-	}
-	if len(password) > 0 && password[0] >= '0' && password[0] <= '9' {
-		password = "Q" + password
-	}
-	if len(password) > 10 {
-		return nil, fmt.Errorf("password too long")
-	}
-	return EncodeEBCDIC37BlankPad(strings.ToUpper(password), 10)
 }

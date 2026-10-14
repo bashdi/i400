@@ -384,8 +384,8 @@ func TestStmtExecContextWritesClobLocatorData(t *testing.T) {
 			return
 		}
 
-		// DeleteDescriptor (deferred) + Close (stmt.Close)
-		for _, wantID := range []uint16{FunctionDeleteDescriptor, FunctionClose} {
+		// DeleteDescriptor (deferred) + DeleteRPB (stmt.Close)
+		for _, wantID := range []uint16{FunctionDeleteDescriptor, FunctionDeleteRPB} {
 			pkt, err := readPacket(server)
 			if err != nil {
 				t.Errorf("read 0x%x: %v", wantID, err)
@@ -557,7 +557,7 @@ func TestStmtExecContextWritesXMLLocatorData(t *testing.T) {
 		}
 
 		// DeleteDescriptor + Close
-		for _, wantID := range []uint16{FunctionDeleteDescriptor, FunctionClose} {
+		for _, wantID := range []uint16{FunctionDeleteDescriptor, FunctionDeleteRPB} {
 			pkt, err := readPacket(server)
 			if err != nil {
 				t.Errorf("read 0x%x: %v", wantID, err)
@@ -700,7 +700,7 @@ func TestStmtExecContextNullBlobSetsNullIndicator(t *testing.T) {
 		}
 
 		// DeleteDescriptor + Close
-		for _, wantID := range []uint16{FunctionDeleteDescriptor, FunctionClose} {
+		for _, wantID := range []uint16{FunctionDeleteDescriptor, FunctionDeleteRPB} {
 			pkt, err := readPacket(server)
 			if err != nil {
 				t.Errorf("read 0x%x: %v", wantID, err)

@@ -1,0 +1,19 @@
+# Local credentials for the integration tests (template: .env_template)
+.env
+
+# Go build and test artifacts
+*.exe
+*.test
+*.out
+*.prof
+coverage.*
+
+# Output of the Java generators in internal/*/gen
+classes/
+*.class
+
+# Editor and OS files
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

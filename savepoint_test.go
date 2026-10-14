@@ -221,6 +221,13 @@ func TestSavepointErrorPropagatesToCaller(t *testing.T) {
 		// Reply with a non-zero sqlCode and state, simulating "savepoint not found".
 		if _, err := server.Write(buildTestReplyPacket(buildTestSQLCAPayload(t, -30102, "428BY", 0))); err != nil {
 			t.Errorf("write error reply: %v", err)
+			return
+		}
+		// The driver then requests the server message text (JTOpen-style follow-up).
+		_, _ = readPacket(server)
+		idPayload := append([]byte{0x00, 0x25}, ebcdicForTest(t, "SQL0204")...)
+		if _, err := server.Write(buildTestReplyPacket(llcpForTest(CodePointMessageID, idPayload))); err != nil {
+			t.Errorf("write message reply: %v", err)
 		}
 	}()
 

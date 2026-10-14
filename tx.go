@@ -98,13 +98,14 @@ func (c *Conn) setAutoCommitState(ctx context.Context, enabled bool) error {
 		return nil
 	}
 
-	request := buildAutoCommitRequest(enabled, commitmentControlForAutoCommit(enabled, c.currentCommitmentMode()))
-	envelope, _, err := c.doRequest(ctx, request)
+	level := serverCommitmentControl(c.cfg, enabled, commitmentControlForAutoCommit(false, c.currentCommitmentMode()))
+	request := buildAutoCommitRequestLevel(enabled, level)
+	envelope, payload, err := c.doRequest(ctx, request)
 	if err != nil {
 		return err
 	}
-	if envelope.hasError() {
-		return newProtocolError("set auto commit", envelope)
+	if err := c.checkReply(ctx, 0, "set auto commit", envelope, payload); err != nil {
+		return err
 	}
 
 	c.mu.Lock()
@@ -115,26 +116,20 @@ func (c *Conn) setAutoCommitState(ctx context.Context, enabled bool) error {
 
 func (c *Conn) commitTransaction(ctx context.Context) error {
 	request := buildCommitRequest()
-	envelope, _, err := c.doRequest(ctx, request)
+	envelope, payload, err := c.doRequest(ctx, request)
 	if err != nil {
 		return err
 	}
-	if envelope.hasError() {
-		return newProtocolError("commit", envelope)
-	}
-	return nil
+	return c.checkReply(ctx, 0, "commit", envelope, payload)
 }
 
 func (c *Conn) rollbackTransaction(ctx context.Context) error {
 	request := buildRollbackRequest()
-	envelope, _, err := c.doRequest(ctx, request)
+	envelope, payload, err := c.doRequest(ctx, request)
 	if err != nil {
 		return err
 	}
-	if envelope.hasError() {
-		return newProtocolError("rollback", envelope)
-	}
-	return nil
+	return c.checkReply(ctx, 0, "rollback", envelope, payload)
 }
 
 func (t *Tx) Commit() error {
@@ -195,9 +190,15 @@ func buildRollbackRequest() []byte {
 }
 
 func buildAutoCommitRequest(enabled bool, commitmentControl int) []byte {
+	return buildAutoCommitRequestLevel(enabled, requestCommitmentControl(enabled, commitmentControl))
+}
+
+// buildAutoCommitRequestLevel sends the autocommit indicator together with an
+// already resolved commitment-control level (see serverCommitmentControl).
+func buildAutoCommitRequestLevel(enabled bool, level uint16) []byte {
 	body := make([]byte, 0, 16)
 	body = appendByteAttribute(body, CodePointTrueAutoCommitIndicator, autoCommitIndicator(enabled))
-	body = appendShortAttribute(body, CodePointCommitmentControlLevel, uint16(requestCommitmentControl(enabled, commitmentControl)))
+	body = appendShortAttribute(body, CodePointCommitmentControlLevel, level)
 	request := buildHeader(uint32(40+len(body)), 0, DatabaseServerID, 20, FunctionSetAttributes)
 	request = appendRequestTemplate(request, orsSendReplyImmediately|0x01000000, 0, 0, 2)
 	return append(request, body...)

@@ -1,8 +1,10 @@
 package i400
 
 import (
+	"bytes"
 	"context"
 	"database/sql/driver"
+	"encoding/binary"
 	"net"
 	"testing"
 	"time"
@@ -69,30 +71,13 @@ func TestStmtCloseClosesPreparedStatementOnServer(t *testing.T) {
 			t.Errorf("parse close request header: %v", err)
 			return
 		}
-		if header.ReqRepID != FunctionClose {
-			t.Errorf("close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionClose)
+		if header.ReqRepID != FunctionDeleteRPB {
+			t.Errorf("close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionDeleteRPB)
 			return
 		}
-		statementPayload, found, err := readTestLLCPValue(packet[40:], CodePointPrepareStatementName)
-		if err != nil {
-			t.Errorf("parse close request body: %v", err)
-			return
-		}
-		if !found {
-			t.Errorf("close request missing prepare statement name")
-			return
-		}
-		if len(statementPayload) < 4 {
-			t.Errorf("statement payload length = %d, want >= 4", len(statementPayload))
-			return
-		}
-		name, err := DecodeEBCDIC37(statementPayload[4:])
-		if err != nil {
-			t.Errorf("decode statement name: %v", err)
-			return
-		}
-		if name != "STMT0001" {
-			t.Errorf("statement name = %q, want %q", name, "STMT0001")
+		// DeleteRPB names the statement by its RPB handle in the template.
+		if handle := binary.BigEndian.Uint16(packet[34:36]); handle != 1 {
+			t.Errorf("RPB handle = %d, want 1", handle)
 			return
 		}
 		if _, err := server.Write(buildTestReplyPacket(nil)); err != nil {
@@ -102,8 +87,9 @@ func TestStmtCloseClosesPreparedStatementOnServer(t *testing.T) {
 	}()
 
 	stmt := &Stmt{
-		conn:          &Conn{netConn: client, autoCommit: true},
-		statementName: "STMT0001",
+		conn:            &Conn{netConn: client, autoCommit: true},
+		statementName:   "STMT0001",
+		statementHandle: 1,
 	}
 
 	if err := stmt.Close(); err != nil {
@@ -162,13 +148,24 @@ func TestStmtCloseWaitsForActiveOperation(t *testing.T) {
 	}
 }
 
-func TestEncodeParameterValueDecfloatUsesTextEncoding(t *testing.T) {
-	field := parameterMarkerField{SQLType: db2TypeDecfloat, CCSID: 1208, Length: 0}
-	encoded, err := encodeParameterValue(field, "123.45", false)
+func TestEncodeParameterValueDecfloatUsesBinaryEncoding(t *testing.T) {
+	field := parameterMarkerField{SQLType: db2TypeDecfloat, CCSID: 1208, Length: 8}
+	encoded, err := encodeParameterValue(field, "1", false)
 	if err != nil {
 		t.Fatalf("encodeParameterValue() error = %v", err)
 	}
-	if string(encoded) != "123.45" {
-		t.Fatalf("encodeParameterValue() = %q, want %q", string(encoded), "123.45")
+	want := []byte{0x22, 0x38, 0, 0, 0, 0, 0, 0x01}
+	if !bytes.Equal(encoded, want) {
+		t.Fatalf("encodeParameterValue() = % x, want % x", encoded, want)
+	}
+
+	field.Length = 16
+	encoded, err = encodeParameterValue(field, "1", false)
+	if err != nil {
+		t.Fatalf("encodeParameterValue() error = %v", err)
+	}
+	want = []byte{0x22, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}
+	if !bytes.Equal(encoded, want) {
+		t.Fatalf("encodeParameterValue() = % x, want % x", encoded, want)
 	}
 }

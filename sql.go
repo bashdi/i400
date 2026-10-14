@@ -10,11 +10,12 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/big"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/bashdi/i400/internal/ccsid"
 )
 
 const (
@@ -70,11 +71,15 @@ const (
 	db2TypeDbclobLocator  = 968
 	db2TypeXML            = 988
 	db2TypeDecfloat       = 996
+	db2TypeBoolean        = 2436
 	db2TypeXMLLocator     = 2452
 )
 
 type columnMeta struct {
-	Name                 string
+	Name string
+	// NameCCSID is the CCSID of Name, set when the name is parsed; the bidi
+	// column name layout is applied by openAndDescribe.
+	NameCCSID            int
 	Label                string
 	BaseColumnName       string
 	BaseTableName        string
@@ -194,6 +199,8 @@ func (c columnMeta) databaseTypeName() string {
 		return "XML"
 	case db2TypeDecfloat:
 		return "DECFLOAT"
+	case db2TypeBoolean:
+		return "BOOLEAN"
 	default:
 		return "UNKNOWN"
 	}
@@ -206,6 +213,8 @@ type resultSetMeta struct {
 	TimeFormat    int
 	DateSeparator int
 	TimeSeparator int
+	// hasDataFormat is set when a super extended data format (0x3812) was parsed.
+	hasDataFormat bool
 }
 
 func (m *resultSetMeta) ensureColumns(count int) error {
@@ -244,6 +253,13 @@ type fetchBlock struct {
 	RowSize       int
 	Nulls         []bool
 	Data          []byte
+	// cursorClosed is set when the server reports (class 2, code 700) that it
+	// closed the cursor itself at end of data (close-on-EOF).
+	cursorClosed bool
+	// endOfData is set when the block holds the last rows of the result set
+	// (class 2, code 701). The server sends no further rows, but the cursor is
+	// still closed explicitly, as JTOpen does.
+	endOfData bool
 }
 
 type parameterMarkerField struct {
@@ -256,6 +272,17 @@ type parameterMarkerField struct {
 	ParameterType int
 	LOBLocator    int
 	LOBMaxSize    int
+	// bidi is the connection's bidi settings, set by buildParameterBindings.
+	// Nil means JTOpen's defaults.
+	bidi *bidiSettings
+}
+
+// textBidi returns the bidi settings for encoding this field's text.
+func (f parameterMarkerField) textBidi() bidiSettings {
+	if f.bidi == nil {
+		return defaultBidiSettings()
+	}
+	return *f.bidi
 }
 
 type parameterMarkerFormat struct {
@@ -297,6 +324,7 @@ type sqlcaInfo struct {
 	UpdateCount     int64
 	ResultSetsCount int
 	Warning         *SQLWarning
+	Tokens          string
 }
 
 type execResult struct {
@@ -307,7 +335,7 @@ type execResult struct {
 
 func (r *execResult) LastInsertId() (int64, error) {
 	if r == nil || !r.hasLastInsert {
-		return 0, ErrUnsupported
+		return 0, errNoGeneratedKey()
 	}
 	return r.lastInsertID, nil
 }
@@ -320,12 +348,15 @@ func (r *execResult) RowsAffected() (int64, error) {
 }
 
 type queryRows struct {
-	conn                 *Conn
-	ctx                  context.Context
-	meta                 *resultSetMeta
-	statementHandle      uint16
-	statementName        string
-	cursorName           string
+	conn            *Conn
+	ctx             context.Context
+	meta            *resultSetMeta
+	statementHandle uint16
+	statementName   string
+	cursorName      string
+	// defaultCursor is set when cursorName is the statement's default name,
+	// which Close releases for the next open on that statement.
+	defaultCursor        bool
 	fetchBufferSize      uint32
 	resultSetCount       int
 	resultSetIndex       int
@@ -333,10 +364,18 @@ type queryRows struct {
 	rowIndex             int
 	currentRow           int
 	currentResultSetDone bool
-	scrollable           bool
-	ownStatement         bool
-	releaseStmt          func()
-	closed               bool
+	// storedProcResult is set for CALL result sets, whose DATE/TIME formats come from the server.
+	storedProcResult bool
+	scrollable       bool
+	ownStatement     bool
+	releaseStmt      func()
+	closed           bool
+	// serverClosed is set when a forward-only cursor was closed by the server
+	// at end of data (close-on-EOF), so no explicit close request is sent.
+	serverClosed bool
+	// endOfData is set when the last block (code 701) has been received; no
+	// further fetch is sent, but the cursor is still closed.
+	endOfData bool
 }
 
 var _ driver.Rows = (*queryRows)(nil)
@@ -380,34 +419,102 @@ func classifySQLStatement(sql string) int {
 	}
 }
 
-func (c *Conn) nextStatementName() (string, uint16) {
+// maxStatements mirrors JTOpen's AS400JDBCConnectionImpl.MAX_STATEMENTS_:
+// statement ids range from 1 to maxStatements-1.
+const maxStatements = 9999
+
+// errMaxStatementsExceeded mirrors JTOpen's EXC_MAX_STATEMENTS_EXCEEDED.
+var errMaxStatementsExceeded = errors.New("as400: maximum number of open statements exceeded")
+
+// nextStatementName assigns the lowest unused statement id, as JTOpen's
+// getUnusedId does. The id is the statement's RPB handle and is released by
+// releaseStatementHandle when the statement is closed.
+func (c *Conn) nextStatementName() (string, uint16, error) {
 	c.nameMu.Lock()
 	defer c.nameMu.Unlock()
-	c.statementSeq++
-	if c.statementSeq == 0 {
-		c.statementSeq = 1
+	if c.usedStatementHandles == nil {
+		c.usedStatementHandles = make(map[uint16]struct{})
 	}
-	return fmt.Sprintf("STMT%08X", c.statementSeq), uint16(c.statementSeq)
+	for id := uint16(1); id < maxStatements; id++ {
+		if _, used := c.usedStatementHandles[id]; !used {
+			c.usedStatementHandles[id] = struct{}{}
+			return fmt.Sprintf("STMT%08X", id), id, nil
+		}
+	}
+	return "", 0, errMaxStatementsExceeded
 }
 
+// releaseStatementHandle marks a statement id as unused again.
+func (c *Conn) releaseStatementHandle(handle uint16) {
+	if c == nil || handle == 0 {
+		return
+	}
+	c.nameMu.Lock()
+	delete(c.usedStatementHandles, handle)
+	c.nameMu.Unlock()
+}
+
+// discardStatement drops a statement whose prepare failed: its RPB already
+// exists on the server, so it is deleted and the id is released.
+func (c *Conn) discardStatement(ctx context.Context, statementName string, statementHandle uint16) {
+	_ = c.closePreparedStatement(ctx, statementName, statementHandle)
+}
+
+// nextDescriptorHandle cycles through 1..65535. Descriptors are deleted after
+// each execute, so a wrapped handle never collides with a live one.
 func (c *Conn) nextDescriptorHandle() uint16 {
 	c.nameMu.Lock()
 	defer c.nameMu.Unlock()
 	c.descriptorSeq++
-	if c.descriptorSeq == 0 {
-		c.descriptorSeq = 1
+	if uint16(c.descriptorSeq) == 0 {
+		c.descriptorSeq++
 	}
 	return uint16(c.descriptorSeq)
 }
 
-func (c *Conn) nextCursorName() string {
+// cursorNameForStatement is the default cursor name of a statement. As in
+// JTOpen (AS400JDBCStatement cursorDefaultName_), it is derived from the
+// statement id and is the name the statement's RPB is created with.
+func cursorNameForStatement(statementHandle uint16) string {
+	return fmt.Sprintf("CRSR%08X", uint32(statementHandle))
+}
+
+// openCursorName chooses the cursor name for a new open on statementHandle.
+// The statement's default name is used whenever it is free, so every name is
+// owned by exactly one statement (a name taken from a separate counter could
+// collide with another statement's RPB and fail with SQLCODE -501). A second
+// cursor open on the same statement gets a unique XCRSR name instead. The
+// boolean reports whether the default name was taken and must be released.
+func (c *Conn) openCursorName(statementHandle uint16) (string, bool) {
 	c.nameMu.Lock()
 	defer c.nameMu.Unlock()
+	if c.defaultCursorBusy == nil {
+		c.defaultCursorBusy = make(map[uint16]bool)
+	}
+	if !c.defaultCursorBusy[statementHandle] {
+		c.defaultCursorBusy[statementHandle] = true
+		return cursorNameForStatement(statementHandle), true
+	}
 	c.cursorSeq++
 	if c.cursorSeq == 0 {
 		c.cursorSeq = 1
 	}
-	return fmt.Sprintf("CRSR%08X", c.cursorSeq)
+	return fmt.Sprintf("XCRSR%08X", c.cursorSeq), false
+}
+
+// releaseDefaultCursor frees the default cursor name of statementHandle after
+// its cursor has been closed.
+func (c *Conn) releaseDefaultCursor(statementHandle uint16) {
+	c.nameMu.Lock()
+	defer c.nameMu.Unlock()
+	delete(c.defaultCursorBusy, statementHandle)
+}
+
+// releaseOpenCursorName undoes openCursorName when the open did not produce rows.
+func (c *Conn) releaseOpenCursorName(statementHandle uint16, defaultCursor bool) {
+	if defaultCursor {
+		c.releaseDefaultCursor(statementHandle)
+	}
 }
 
 func (c *Conn) doRequest(ctx context.Context, request []byte) (replyEnvelope, []byte, error) {
@@ -617,39 +724,75 @@ func (c *Conn) queryContext(ctx context.Context, query string, args []driver.Nam
 		return nil, unsupported("QueryContext only supports SELECT, VALUES, WITH, or CALL statements")
 	}
 
-	statementName, statementHandle := c.nextStatementName()
+	statementName, statementHandle, err := c.nextStatementName()
+	if err != nil {
+		return nil, err
+	}
+	// Until the rows own the statement, a failure must release its id and,
+	// once the RPB exists on the server, delete the RPB as well.
+	rpbCreated, owned := false, false
+	defer func() {
+		switch {
+		case owned:
+		case rpbCreated:
+			c.discardStatement(ctx, statementName, statementHandle)
+		default:
+			c.releaseStatementHandle(statementHandle)
+		}
+	}()
 
 	// Create the RPB on the server as a fire-and-forget preamble (no reply) before prepare.
-	creatRPBReq, err := buildCreateRPBRequest(statementHandle, statementName)
+	if err := c.ensurePackage(ctx); err != nil {
+		return nil, err
+	}
+	creatRPBReq, err := buildCreateRPBRequest(statementHandle, statementName, c.pkg.specForLibrary())
 	if err != nil {
 		return nil, err
 	}
 
-	prepareRequest, err := buildPrepareAndDescribeRequest(statementHandle, statementName, query)
+	prepareRequest, err := buildPrepareAndDescribeRequestCCSID(statementHandle, statementName, c.bidiStatementText(query), c.pkg.specForPrepare(statementHandle, query), c.statementTextCCSID())
 	if err != nil {
 		return nil, err
 	}
+	rpbCreated = true
 	envelope, payload, err := c.doRequestWithPreamble(ctx, creatRPBReq, prepareRequest)
 	if err != nil {
 		return nil, err
 	}
-	if envelope.hasError() {
-		return nil, newProtocolError("prepare", envelope)
+	if err := c.checkReply(ctx, statementHandle, "prepare", envelope, payload); err != nil {
+		return nil, err
 	}
 	prepareSQLCA, err := parseSQLCAFromPayload(payload)
 	if err != nil {
 		return nil, err
 	}
 	if prepareSQLCA.SQLCode < 0 {
-		message := "SQL execution failed"
-		if prepareSQLCA.SQLState != "" {
-			message = fmt.Sprintf("SQL execution failed (%s)", prepareSQLCA.SQLState)
-		}
-		return nil, &SQLError{Code: int(prepareSQLCA.SQLCode), State: prepareSQLCA.SQLState, Message: message}
+		return nil, c.newSQLError(ctx, statementHandle, prepareSQLCA)
 	}
 	c.recordWarning(prepareSQLCA.Warning)
 
-	return c.queryRowsForStatement(ctx, statementHandle, statementName)
+	var rows driver.Rows
+	if statementType == sqlStatementTypeCall {
+		rows, err = c.queryCallRows(ctx, statementHandle, statementName)
+	} else {
+		rows, err = c.queryRowsForStatement(ctx, statementHandle, statementName)
+	}
+	if err != nil {
+		return nil, err
+	}
+	qr, ok := rows.(*queryRows)
+	if !ok {
+		// Rows that cannot delete the statement on close: delete it now.
+		return rows, nil
+	}
+	// The statement was prepared for this query only, so closing the rows
+	// deletes its RPB, as JTOpen does when the statement is closed.
+	qr.ownStatement = true
+	owned = true
+	if statementType == sqlStatementTypeCall {
+		qr.storedProcResult = true
+	}
+	return rows, nil
 }
 
 func (c *Conn) execContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -662,7 +805,10 @@ func (c *Conn) execContext(ctx context.Context, query string, args []driver.Name
 		return nil, unsupported("ExecContext cannot execute query statements")
 	}
 
-	request, err := buildExecuteImmediateRequest(query, statementType)
+	if err := c.ensurePackage(ctx); err != nil {
+		return nil, err
+	}
+	request, err := buildExecuteImmediateRequestCCSID(c.bidiStatementText(query), statementType, c.pkg.specForImmediate(query), c.statementTextCCSID())
 	if err != nil {
 		return nil, err
 	}
@@ -670,8 +816,8 @@ func (c *Conn) execContext(ctx context.Context, query string, args []driver.Name
 	if err != nil {
 		return nil, err
 	}
-	if envelope.hasError() {
-		return nil, newProtocolError("execute", envelope)
+	if err := c.checkReply(ctx, 0, "execute", envelope, payload); err != nil {
+		return nil, err
 	}
 
 	info, err := parseSQLCAFromPayload(payload)
@@ -680,11 +826,7 @@ func (c *Conn) execContext(ctx context.Context, query string, args []driver.Name
 	}
 	c.recordWarning(info.Warning)
 	if info.SQLCode < 0 {
-		message := "SQL execution failed"
-		if info.SQLState != "" {
-			message = fmt.Sprintf("SQL execution failed (%s)", info.SQLState)
-		}
-		return nil, &SQLError{Code: int(info.SQLCode), State: info.SQLState, Message: message}
+		return nil, c.newSQLError(ctx, 0, info)
 	}
 	if info.ResultSetsCount > 0 {
 		return nil, fmt.Errorf("statement returned result sets; use QueryContext")
@@ -705,8 +847,11 @@ func (c *Conn) execPrepared(ctx context.Context, statementHandle uint16, stateme
 	if statementType == sqlStatementTypeSelect {
 		return nil, unsupported("ExecContext cannot execute query statements")
 	}
-	bindings, err := buildParameterBindings(format, args)
+	bindings, err := buildParameterBindingsWithBidi(format, args, bidiSettingsForConn(c))
 	if err != nil {
+		return nil, err
+	}
+	if err := c.syncQueryTimeoutRPB(ctx, statementHandle); err != nil {
 		return nil, err
 	}
 	descriptorHandle := uint16(0)
@@ -721,28 +866,23 @@ func (c *Conn) execPrepared(ctx context.Context, statementHandle uint16, stateme
 		}
 		defer func() {
 			deleteRequest := buildDeleteDescriptorRequest(statementHandle, descriptorHandle)
-			if envelope, _, err := c.doRequest(ctx, deleteRequest); err == nil && envelope.hasError() {
-				_ = newProtocolError("delete descriptor", envelope)
-			}
+			deleteEnvelope, _, deleteErr := c.doRequest(ctx, deleteRequest)
+			c.recordDeleteDescriptorFailure(deleteErr, deleteEnvelope)
 		}()
 
 		envelope, payload, err = c.doRequest(ctx, changeRequest)
 		if err != nil {
 			return nil, err
 		}
-		if envelope.hasError() {
-			return nil, newProtocolError("change descriptor", envelope)
+		if err := c.checkReply(ctx, statementHandle, "change descriptor", envelope, payload); err != nil {
+			return nil, err
 		}
 		info, err = parseSQLCAFromPayload(payload)
 		if err != nil {
 			return nil, err
 		}
 		if info.SQLCode < 0 {
-			message := "SQL execution failed"
-			if info.SQLState != "" {
-				message = fmt.Sprintf("SQL execution failed (%s)", info.SQLState)
-			}
-			return nil, &SQLError{Code: int(info.SQLCode), State: info.SQLState, Message: message}
+			return nil, c.newSQLError(ctx, statementHandle, info)
 		}
 		c.recordWarning(info.Warning)
 		if err := c.writeLOBDataRequests(ctx, bindings); err != nil {
@@ -750,7 +890,7 @@ func (c *Conn) execPrepared(ctx context.Context, statementHandle uint16, stateme
 		}
 	}
 
-	request, err := buildExecutePreparedRequest(statementHandle, descriptorHandle, statementType, format, bindings)
+	request, err := buildExecutePreparedRequest(statementHandle, descriptorHandle, statementType, format, bindings, c.pkg.specForExecute(statementHandle))
 	if err != nil {
 		return nil, err
 	}
@@ -758,8 +898,8 @@ func (c *Conn) execPrepared(ctx context.Context, statementHandle uint16, stateme
 	if err != nil {
 		return nil, err
 	}
-	if envelope.hasError() {
-		return nil, newProtocolError("execute", envelope)
+	if err := c.checkReply(ctx, statementHandle, "execute", envelope, payload); err != nil {
+		return nil, err
 	}
 
 	info, err = parseSQLCAFromPayload(payload)
@@ -768,11 +908,7 @@ func (c *Conn) execPrepared(ctx context.Context, statementHandle uint16, stateme
 	}
 	c.recordWarning(info.Warning)
 	if info.SQLCode < 0 {
-		message := "SQL execution failed"
-		if info.SQLState != "" {
-			message = fmt.Sprintf("SQL execution failed (%s)", info.SQLState)
-		}
-		return nil, &SQLError{Code: int(info.SQLCode), State: info.SQLState, Message: message}
+		return nil, c.newSQLError(ctx, statementHandle, info)
 	}
 	if statementType == sqlStatementTypeCall {
 		if err := assignCallOutputParameters(ctx, c, payload, bindings); err != nil {
@@ -799,12 +935,15 @@ func (c *Conn) prepareAndDescribe(ctx context.Context, statementHandle uint16, s
 	// a prepare-describe request can reference it. JTOpen calls syncRPB() first,
 	// using fire-and-forget (no reply). We send Create RPB as a preamble together
 	// with Prepare-Describe under one lock.
-	creatRPBReq, err := buildCreateRPBRequest(statementHandle, statementName)
+	if err := c.ensurePackage(ctx); err != nil {
+		return nil, nil, err
+	}
+	creatRPBReq, err := buildCreateRPBRequest(statementHandle, statementName, c.pkg.specForLibrary())
 	if err != nil {
 		return nil, nil, err
 	}
 
-	request, err := buildPrepareAndDescribeRequest(statementHandle, statementName, query)
+	request, err := buildPrepareAndDescribeRequestCCSID(statementHandle, statementName, c.bidiStatementText(query), c.pkg.specForPrepare(statementHandle, query), c.statementTextCCSID())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -815,19 +954,15 @@ func (c *Conn) prepareAndDescribe(ctx context.Context, statementHandle uint16, s
 		}
 		return nil, nil, err
 	}
-	if envelope.hasError() {
-		return nil, nil, newProtocolError("prepare", envelope)
+	if err := c.checkReply(ctx, statementHandle, "prepare", envelope, payload); err != nil {
+		return nil, nil, err
 	}
 	info, err := parseSQLCAFromPayload(payload)
 	if err != nil {
 		return nil, nil, err
 	}
 	if info.SQLCode < 0 {
-		message := "SQL execution failed"
-		if info.SQLState != "" {
-			message = fmt.Sprintf("SQL execution failed (%s)", info.SQLState)
-		}
-		return nil, nil, &SQLError{Code: int(info.SQLCode), State: info.SQLState, Message: message}
+		return nil, nil, c.newSQLError(ctx, statementHandle, info)
 	}
 	c.recordWarning(info.Warning)
 	parameterFormat, err := parseParameterMarkerFormatFromPayload(payload)
@@ -838,10 +973,11 @@ func (c *Conn) prepareAndDescribe(ctx context.Context, statementHandle uint16, s
 }
 
 func (c *Conn) queryRowsForStatement(ctx context.Context, statementHandle uint16, statementName string) (driver.Rows, error) {
-	cursorName := c.nextCursorName()
+	cursorName, defaultCursor := c.openCursorName(statementHandle)
 
 	meta, sqlca, err := c.openAndDescribe(ctx, statementHandle, statementName, cursorName, 0, nil, nil)
 	if err != nil {
+		c.releaseOpenCursorName(statementHandle, defaultCursor)
 		return nil, err
 	}
 	c.recordWarning(sqlca.Warning)
@@ -853,6 +989,7 @@ func (c *Conn) queryRowsForStatement(ctx context.Context, statementHandle uint16
 		meta = &resultSetMeta{}
 	}
 	if len(meta.columns) == 0 && resultSetCount == 1 {
+		c.releaseOpenCursorName(statementHandle, defaultCursor)
 		return nil, fmt.Errorf("query did not return a result set")
 	}
 	if meta.RowSize == 0 {
@@ -866,7 +1003,8 @@ func (c *Conn) queryRowsForStatement(ctx context.Context, statementHandle uint16
 		statementHandle:      statementHandle,
 		statementName:        statementName,
 		cursorName:           cursorName,
-		fetchBufferSize:      256 * 1024,
+		defaultCursor:        defaultCursor,
+		fetchBufferSize:      c.cfg.fetchBufferBytes(),
 		resultSetCount:       resultSetCount,
 		resultSetIndex:       1,
 		currentResultSetDone: len(meta.columns) == 0,
@@ -887,7 +1025,7 @@ func (c *Conn) queryPreparedWithArgs(ctx context.Context, statementHandle uint16
 	if strings.TrimSpace(statementName) == "" {
 		return nil, driver.ErrBadConn
 	}
-	bindings, err := buildParameterBindings(format, args)
+	bindings, err := buildParameterBindingsWithBidi(format, args, bidiSettingsForConn(c))
 	if err != nil {
 		return nil, err
 	}
@@ -902,9 +1040,8 @@ func (c *Conn) queryPreparedWithArgs(ctx context.Context, statementHandle uint16
 	}
 	defer func() {
 		deleteRequest := buildDeleteDescriptorRequest(statementHandle, descriptorHandle)
-		if envelope, _, err := c.doRequest(ctx, deleteRequest); err == nil && envelope.hasError() {
-			_ = fmt.Errorf("delete descriptor request failed: class=%d code=0x%x", envelope.RCClass, uint32(envelope.RCCode))
-		}
+		deleteEnvelope, _, deleteErr := c.doRequest(ctx, deleteRequest)
+		c.recordDeleteDescriptorFailure(deleteErr, deleteEnvelope)
 	}()
 
 	envelope, payload, err := c.doRequest(ctx, changeRequest)
@@ -914,19 +1051,15 @@ func (c *Conn) queryPreparedWithArgs(ctx context.Context, statementHandle uint16
 		}
 		return nil, err
 	}
-	if envelope.hasError() {
-		return nil, newProtocolError("change descriptor", envelope)
+	if err := c.checkReply(ctx, statementHandle, "change descriptor", envelope, payload); err != nil {
+		return nil, err
 	}
 	info, err := parseSQLCAFromPayload(payload)
 	if err != nil {
 		return nil, err
 	}
 	if info.SQLCode < 0 {
-		message := "SQL execution failed"
-		if info.SQLState != "" {
-			message = fmt.Sprintf("SQL execution failed (%s)", info.SQLState)
-		}
-		return nil, &SQLError{Code: int(info.SQLCode), State: info.SQLState, Message: message}
+		return nil, c.newSQLError(ctx, statementHandle, info)
 	}
 	c.recordWarning(info.Warning)
 	if err := c.writeLOBDataRequests(ctx, bindings); err != nil {
@@ -937,9 +1070,10 @@ func (c *Conn) queryPreparedWithArgs(ctx context.Context, statementHandle uint16
 }
 
 func (c *Conn) queryRowsForStatementWithBindings(ctx context.Context, statementHandle uint16, statementName string, descriptorHandle uint16, format *parameterMarkerFormat, bindings []parameterBinding) (driver.Rows, error) {
-	cursorName := c.nextCursorName()
+	cursorName, defaultCursor := c.openCursorName(statementHandle)
 	meta, sqlca, err := c.openAndDescribe(ctx, statementHandle, statementName, cursorName, descriptorHandle, format, bindings)
 	if err != nil {
+		c.releaseOpenCursorName(statementHandle, defaultCursor)
 		return nil, err
 	}
 	c.recordWarning(sqlca.Warning)
@@ -964,7 +1098,8 @@ func (c *Conn) queryRowsForStatementWithBindings(ctx context.Context, statementH
 		statementHandle:      statementHandle,
 		statementName:        statementName,
 		cursorName:           cursorName,
-		fetchBufferSize:      256 * 1024,
+		defaultCursor:        defaultCursor,
+		fetchBufferSize:      c.cfg.fetchBufferBytes(),
 		resultSetCount:       resultSetCount,
 		resultSetIndex:       1,
 		currentResultSetDone: len(meta.columns) == 0,
@@ -974,7 +1109,10 @@ func (c *Conn) queryRowsForStatementWithBindings(ctx context.Context, statementH
 }
 
 func (c *Conn) openAndDescribe(ctx context.Context, statementHandle uint16, statementName, cursorName string, descriptorHandle uint16, format *parameterMarkerFormat, bindings []parameterBinding) (*resultSetMeta, *sqlcaInfo, error) {
-	request, err := buildOpenDescribePreparedRequest(statementHandle, descriptorHandle, statementName, cursorName, format, bindings, c.cfg.ScrollableCursors, c.cfg.HoldCursors)
+	if err := c.syncQueryTimeoutRPB(ctx, statementHandle); err != nil {
+		return nil, nil, err
+	}
+	request, err := buildOpenDescribePreparedRequest(statementHandle, descriptorHandle, statementName, cursorName, format, bindings, c.cfg.ScrollableCursors, c.cfg.HoldCursors, c.pkg.specForExecute(statementHandle))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -987,29 +1125,28 @@ func (c *Conn) openAndDescribe(ctx context.Context, statementHandle uint16, stat
 		}
 		return nil, nil, err
 	}
-	if envelope.hasError() {
-		return nil, nil, newProtocolError("open", envelope)
+	if err := c.checkReply(ctx, statementHandle, "open", envelope, payload); err != nil {
+		return nil, nil, err
 	}
 	info, err := parseSQLCAFromPayload(payload)
 	if err != nil {
 		return nil, nil, err
 	}
 	if info.SQLCode < 0 {
-		message := "SQL execution failed"
-		if info.SQLState != "" {
-			message = fmt.Sprintf("SQL execution failed (%s)", info.SQLState)
-		}
-		return nil, nil, &SQLError{Code: int(info.SQLCode), State: info.SQLState, Message: message}
+		return nil, nil, c.newSQLError(ctx, statementHandle, info)
 	}
 	meta, err := parseDescribePayload(payload)
 	if err != nil {
 		return nil, nil, err
 	}
+	for i := range meta.columns {
+		meta.columns[i].Name = c.bidiColumnName(meta.columns[i].Name, meta.columns[i].NameCCSID)
+	}
 	return meta, info, nil
 }
 
 func (c *Conn) fetchRows(ctx context.Context, statementHandle uint16, cursorName string, fetchBufferSize uint32, option int, relative int) (*fetchBlock, error) {
-	request, err := buildFetchRequest(cursorName, fetchBufferSize, option, relative)
+	request, err := buildFetchRequestForStatement(statementHandle, cursorName, fetchBufferSize, option, relative)
 	if err != nil {
 		return nil, err
 	}
@@ -1022,10 +1159,23 @@ func (c *Conn) fetchRows(ctx context.Context, statementHandle uint16, cursorName
 		}
 		return nil, err
 	}
-	if envelope.hasError() {
-		return nil, newProtocolError("fetch", envelope)
+	if err := c.checkReply(ctx, statementHandle, "fetch", envelope, payload); err != nil {
+		return nil, err
 	}
-	return parseFetchPayload(payload)
+	block, err := parseFetchPayload(payload)
+	if err != nil {
+		return nil, err
+	}
+	// Like JTOpen, class 2 / code 700 means the server already closed the cursor.
+	// Class 2 / code 701 marks the last block of a result set: JTOpen sends no
+	// further fetch after it and closes the cursor.
+	if envelope.RCClass == 2 && envelope.RCCode == 700 {
+		block.cursorClosed = true
+	}
+	if envelope.RCClass == 2 && envelope.RCCode == 701 {
+		block.endOfData = true
+	}
+	return block, nil
 }
 
 func (c *Conn) closeCursor(ctx context.Context, cursorName string, reuseIndicator byte) error {
@@ -1036,32 +1186,34 @@ func (c *Conn) closeCursor(ctx context.Context, cursorName string, reuseIndicato
 	if err != nil {
 		return err
 	}
-	envelope, _, err := c.doRequest(ctx, request)
+	envelope, payload, err := c.doRequest(ctx, request)
 	if err != nil {
 		return err
 	}
-	if envelope.hasError() {
-		return newProtocolError("close cursor", envelope)
-	}
-	return nil
+	return c.checkReply(ctx, 0, "close cursor", envelope, payload)
 }
 
-func (c *Conn) closePreparedStatement(ctx context.Context, statementName string) error {
+// closePreparedStatement releases a statement that the driver prepared. As in
+// JTOpen, this deletes the statement's RPB by handle; a close by statement
+// name is not supported on IBM i (SQLCODE -103), and until the RPB is deleted
+// the server keeps the statement's file open, so DROP TABLE reports it in use.
+func (c *Conn) closePreparedStatement(ctx context.Context, statementName string, statementHandle uint16) error {
 	if strings.TrimSpace(statementName) == "" {
 		return nil
 	}
-	request, err := buildClosePreparedStatementRequest(statementName)
+	// As in JTOpen, the id is free again once the statement is closed,
+	// whether or not the server accepted the delete.
+	defer c.releaseStatementHandle(statementHandle)
+	// Statements taken from the package cache are shared, and JTOpen never
+	// closes them on the server.
+	if c != nil && c.pkg.isCachedStatementName(statementName) {
+		return nil
+	}
+	envelope, payload, err := c.doRequest(ctx, buildDeleteRPBRequest(statementHandle))
 	if err != nil {
 		return err
 	}
-	envelope, _, err := c.doRequest(ctx, request)
-	if err != nil {
-		return err
-	}
-	if envelope.hasError() {
-		return newProtocolError("close prepared statement", envelope)
-	}
-	return nil
+	return c.checkReply(ctx, 0, "delete RPB", envelope, payload)
 }
 
 func (r *queryRows) Columns() []string {
@@ -1083,6 +1235,9 @@ func (r *queryRows) ColumnTypeScanType(index int) reflect.Type {
 	col, ok := r.columnMetaAt(index)
 	if !ok {
 		return nil
+	}
+	if col.db2Type() == db2TypeTimestamp && dateTimeSettingsForConn(r.conn).TimestampString {
+		return reflect.TypeOf("")
 	}
 	return columnScanType(col)
 }
@@ -1153,10 +1308,15 @@ func columnScanType(col columnMeta) reflect.Type {
 		return reflect.TypeOf(int64(0))
 	case db2TypeDecfloat:
 		return reflect.TypeOf("")
+	case db2TypeBoolean:
+		return reflect.TypeOf(false)
+	case db2TypeClob, db2TypeDbclob, db2TypeXML, db2TypeClobLocator, db2TypeDbclobLocator, db2TypeXMLLocator:
+		if col.CCSID == 65535 {
+			return reflect.TypeOf([]byte(nil))
+		}
+		return reflect.TypeOf("")
 	case db2TypeBinary, db2TypeVarbinary, db2TypeRowID,
-		db2TypeBlob, db2TypeClob, db2TypeDbclob, db2TypeXML,
-		db2TypeBlobLocator, db2TypeClobLocator, db2TypeDbclobLocator,
-		db2TypeXMLLocator:
+		db2TypeBlob, db2TypeBlobLocator:
 		return reflect.TypeOf([]byte(nil))
 	default:
 		return reflect.TypeOf([]byte(nil))
@@ -1212,10 +1372,20 @@ func (r *queryRows) Next(dest []driver.Value) error {
 			return io.EOF
 		}
 
-		block, err := r.conn.fetchRows(r.ctx, r.statementHandle, r.cursorName, r.fetchBufferSize, fetchNext, 0)
-		if err != nil {
-			_ = r.Close()
-			return err
+		var block *fetchBlock
+		if !r.serverClosed && !r.endOfData {
+			fetched, err := r.conn.fetchRows(r.ctx, r.statementHandle, r.cursorName, r.fetchBufferSize, fetchNext, 0)
+			if err != nil {
+				_ = r.Close()
+				return err
+			}
+			block = fetched
+			if block != nil && block.cursorClosed && !r.scrollable {
+				r.serverClosed = true
+			}
+			if block != nil && block.endOfData {
+				r.endOfData = true
+			}
 		}
 		if block == nil || block.RowCount == 0 {
 			r.currentResultSetDone = true
@@ -1305,15 +1475,22 @@ func (r *queryRows) NextResultSet() error {
 		r.closed = true
 		return driver.ErrBadConn
 	}
-	if err := r.conn.closeCursor(r.ctx, r.cursorName, cursorReuseResultSet); err != nil {
-		r.closed = true
-		return err
+	// The cursor of the current result set is closed as JTOpen does it, with a
+	// request that gets no reply, before the next result set is opened. A
+	// cursor the server already closed (code 700) needs no close.
+	if !r.serverClosed && strings.TrimSpace(r.cursorName) != "" {
+		if err := r.conn.closeResultSetCursorNoReply(r.ctx, r.statementHandle, r.cursorName, cursorReuseResultSet); err != nil {
+			r.closed = true
+			return err
+		}
 	}
 	meta, sqlca, err := r.conn.openAndDescribe(r.ctx, r.statementHandle, r.statementName, r.cursorName, 0, nil, nil)
 	if err != nil {
 		r.closed = true
 		return err
 	}
+	r.serverClosed = false
+	r.endOfData = false
 	r.conn.recordWarning(sqlca.Warning)
 	if meta == nil {
 		meta = &resultSetMeta{}
@@ -1336,13 +1513,23 @@ func (r *queryRows) Close() error {
 	r.closed = true
 	var closeErr error
 	if r.conn != nil {
-		closeErr = r.conn.closeCursor(r.ctx, r.cursorName, cursorReuseYes)
+		if r.defaultCursor {
+			defer r.conn.releaseDefaultCursor(r.statementHandle)
+		}
+		switch {
+		case r.serverClosed:
+			// The server closed the cursor at end of data (code 700).
+		case r.endOfData && strings.TrimSpace(r.cursorName) != "":
+			// Last block (code 701): JTOpen closes the cursor without a reply.
+			closeErr = r.conn.closeResultSetCursorNoReply(r.ctx, r.statementHandle, r.cursorName, cursorReuseYes)
+		default:
+			closeErr = r.conn.closeCursor(r.ctx, r.cursorName, cursorReuseYes)
+		}
 		if r.ownStatement && strings.TrimSpace(r.statementName) != "" {
-			// Ignore the error: IBM i does not support an explicit
-			// "close prepared statement" request (FunctionClose with a
-			// statement name returns class=2 code=-103).  The server
-			// cleans up the prepared statement when the connection ends.
-			_ = r.conn.closePreparedStatement(r.ctx, r.statementName)
+			// Ignore the error: the statement's RPB is deleted as JTOpen does
+			// when a statement closes (a close by statement name is not
+			// supported by IBM i, class=2 code=-103).
+			_ = r.conn.closePreparedStatement(r.ctx, r.statementName, r.statementHandle)
 		}
 	}
 	if r.releaseStmt != nil {
@@ -1368,7 +1555,11 @@ func (r *queryRows) decodeCurrentRow(dest []driver.Value) error {
 			dest[i] = nil
 			continue
 		}
-		value, err := decodeColumnValueWithContext(r.ctx, r.conn, r.meta.columns[i], row)
+		dt := r.meta.dateTimeSettingsFor(r.conn, r.storedProcResult)
+		value, err := decodeColumnValueWithBidi(r.meta.columns[i], row, dt, bidiSettingsForConn(r.conn))
+		if err == nil {
+			value, err = resolveLobLocatorValue(r.ctx, r.conn, r.meta.columns[i], value)
+		}
 		if err != nil {
 			return err
 		}
@@ -1380,7 +1571,7 @@ func (r *queryRows) decodeCurrentRow(dest []driver.Value) error {
 // buildCreateRPBRequest builds a "Create RPB" (Request Parameter Block) request.
 // JTOpen calls syncRPB() before every prepare; the server requires the RPB to
 // exist before a FunctionPrepareDescribe request can reference it.
-func buildCreateRPBRequest(statementHandle uint16, statementName string) ([]byte, error) {
+func buildCreateRPBRequest(statementHandle uint16, statementName string, pkg *packageSpec) ([]byte, error) {
 	body := make([]byte, 0, 128)
 	parms := 0
 
@@ -1391,15 +1582,16 @@ func buildCreateRPBRequest(statementHandle uint16, statementName string) ([]byte
 	body = append(body, nameAttr...)
 	parms++
 
-	// Include a cursor name; use a name derived from the statement handle so
-	// the server has it even though we may not open a cursor for DML.
-	cursorName := fmt.Sprintf("CRSR%08X", uint32(statementHandle))
+	// The statement's default cursor name (see cursorNameForStatement).
+	cursorName := cursorNameForStatement(statementHandle)
 	cursorAttr, err := appendNameAttribute(0x380B, cursorName)
 	if err != nil {
 		return nil, err
 	}
 	body = append(body, cursorAttr...)
 	parms++
+
+	body, parms = pkg.appendLibraryAttributes(body, parms)
 
 	length := 40 + len(body)
 	// ORS bitmap = 0: no return data requested; reply is just class/returncode.
@@ -1409,7 +1601,13 @@ func buildCreateRPBRequest(statementHandle uint16, statementName string) ([]byte
 	return request, nil
 }
 
-func buildPrepareAndDescribeRequest(statementHandle uint16, statementName, query string) ([]byte, error) {
+func buildPrepareAndDescribeRequest(statementHandle uint16, statementName, query string, pkg *packageSpec) ([]byte, error) {
+	return buildPrepareAndDescribeRequestCCSID(statementHandle, statementName, query, pkg, defaultPackageCCSID)
+}
+
+// buildPrepareAndDescribeRequestCCSID is buildPrepareAndDescribeRequest with the
+// statement text CCSID given explicitly (see statementTextCCSID).
+func buildPrepareAndDescribeRequestCCSID(statementHandle uint16, statementName, query string, pkg *packageSpec, textCCSID int) ([]byte, error) {
 	body := make([]byte, 0, 256)
 	parms := 0
 	statementType := classifySQLStatement(query)
@@ -1428,7 +1626,9 @@ func buildPrepareAndDescribeRequest(statementHandle uint16, statementName, query
 		parms++
 	}
 
-	extendedTextAttr, err := appendExtendedSQLTextAttribute(query)
+	body, parms = pkg.appendPrepareAttributes(body, parms)
+
+	extendedTextAttr, err := appendExtendedSQLTextAttribute(query, textCCSID)
 	if err != nil {
 		return nil, err
 	}
@@ -1482,6 +1682,14 @@ func buildOpenAndDescribeRequest(statementName, cursorName string) ([]byte, erro
 }
 
 func buildFetchRequest(cursorName string, fetchBufferSize uint32, option int, relative int) ([]byte, error) {
+	return buildFetchRequestForStatement(0, cursorName, fetchBufferSize, option, relative)
+}
+
+// buildFetchRequestForStatement builds a fetch whose request template carries
+// the statement handle, as JTOpen's JDServerRowCache does. Result sets returned
+// by a CALL are only fetched correctly when the handle is set; with handle 0
+// the server answers with SQLCODE class 7 / -101 or -501.
+func buildFetchRequestForStatement(statementHandle uint16, cursorName string, fetchBufferSize uint32, option int, relative int) ([]byte, error) {
 	body := make([]byte, 0, 128)
 	parms := 0
 
@@ -1505,7 +1713,7 @@ func buildFetchRequest(cursorName string, fetchBufferSize uint32, option int, re
 	length := 40 + len(body)
 	request := buildHeader(uint32(length), 0, DatabaseServerID, 20, FunctionFetch)
 	templateBitmap := orsSendReplyImmediately | orsResultData
-	request = appendRequestTemplate(request, templateBitmap, 0, 0, parms)
+	request = appendRequestTemplate(request, templateBitmap, statementHandle, 0, parms)
 	request = append(request, body...)
 	return request, nil
 }
@@ -1531,17 +1739,44 @@ func buildCloseCursorRequest(cursorName string, reuseIndicator byte) ([]byte, er
 	return request, nil
 }
 
-func buildClosePreparedStatementRequest(statementName string) ([]byte, error) {
+// closeResultSetCursorNoReply closes the cursor of a result set that is about
+// to be reopened. JTOpen sends this close with the statement's RPB handle and
+// ORS bitmap 0x00040000 (no reply requested), and it does so even when the
+// server already closed the cursor at end of data (code 701). Without the
+// close the reopen of the next result set fails with PWS0002 (-99997).
+func (c *Conn) closeResultSetCursorNoReply(ctx context.Context, statementHandle uint16, cursorName string, reuseIndicator byte) error {
+	request, err := buildCloseResultSetCursorRequest(statementHandle, cursorName, reuseIndicator)
+	if err != nil {
+		return err
+	}
+	return c.sendRequestNoReply(ctx, request)
+}
+
+func buildCloseResultSetCursorRequest(statementHandle uint16, cursorName string, reuseIndicator byte) ([]byte, error) {
 	body := make([]byte, 0, 64)
-	statementAttr, err := appendNameAttribute(CodePointPrepareStatementName, statementName)
+	parms := 0
+
+	cursorAttr, err := appendNameAttribute(0x380B, cursorName)
 	if err != nil {
 		return nil, err
 	}
-	body = append(body, statementAttr...)
-	request := buildHeader(uint32(40+len(body)), 0, DatabaseServerID, 20, FunctionClose)
-	request = appendRequestTemplate(request, orsSendReplyImmediately, 0, 0, 1)
+	body = append(body, cursorAttr...)
+	parms++
+	body = appendByteAttribute(body, 0x3810, reuseIndicator)
+	parms++
+
+	length := 40 + len(body)
+	request := buildHeader(uint32(length), 0, DatabaseServerID, 20, FunctionClose)
+	request = appendRequestTemplate(request, orsReplyRLECompressed, statementHandle, 0, parms)
 	request = append(request, body...)
 	return request, nil
+}
+
+// buildDeleteRPBRequest deletes the RPB of a statement by its handle, as
+// JTOpen's DBSQLRPBDS FUNCTIONID_DELETE_RPB request does (ORS 0x80040000).
+func buildDeleteRPBRequest(statementHandle uint16) []byte {
+	request := buildHeader(40, 0, DatabaseServerID, 20, FunctionDeleteRPB)
+	return appendRequestTemplate(request, orsSendReplyImmediately|orsReplyRLECompressed, statementHandle, 0, 0)
 }
 
 func buildTestConnectionRequest() []byte {
@@ -1549,7 +1784,13 @@ func buildTestConnectionRequest() []byte {
 	return appendRequestTemplate(request, orsSendReplyImmediately, 0, 0, 0)
 }
 
-func buildExecuteImmediateRequest(query string, statementType int) ([]byte, error) {
+func buildExecuteImmediateRequest(query string, statementType int, pkg *packageSpec) ([]byte, error) {
+	return buildExecuteImmediateRequestCCSID(query, statementType, pkg, defaultPackageCCSID)
+}
+
+// buildExecuteImmediateRequestCCSID is buildExecuteImmediateRequest with the
+// statement text CCSID given explicitly (see statementTextCCSID).
+func buildExecuteImmediateRequestCCSID(query string, statementType int, pkg *packageSpec, textCCSID int) ([]byte, error) {
 	body := make([]byte, 0, 256)
 	parms := 0
 
@@ -1558,11 +1799,15 @@ func buildExecuteImmediateRequest(query string, statementType int) ([]byte, erro
 		parms++
 		body = appendByteAttribute(body, 0x3809, 0x80)
 		parms++
-		body = appendByteAttribute(body, 0x3808, 0)
-		parms++
+		if pkg == nil {
+			body = appendByteAttribute(body, 0x3808, 0)
+			parms++
+		}
 	}
 
-	extendedTextAttr, err := appendExtendedSQLTextAttribute(query)
+	body, parms = pkg.appendPrepareAttributes(body, parms)
+
+	extendedTextAttr, err := appendExtendedSQLTextAttribute(query, textCCSID)
 	if err != nil {
 		return nil, err
 	}
@@ -1630,12 +1875,15 @@ func appendShortIntAttribute(dst []byte, codePoint, value uint16, relative uint3
 	return appendU32(dst, relative)
 }
 
-func appendExtendedSQLTextAttribute(query string) ([]byte, error) {
-	encoded := EncodeUTF16BE(query)
+func appendExtendedSQLTextAttribute(query string, ccsidValue int) ([]byte, error) {
+	encoded, err := encodeTextBytes(query, ccsidValue)
+	if err != nil {
+		return nil, err
+	}
 	attr := make([]byte, 0, 12+len(encoded))
 	attr = appendU32(attr, uint32(12+len(encoded)))
 	attr = appendU16(attr, 0x3831)
-	attr = appendU16(attr, 13488)
+	attr = appendU16(attr, uint16(ccsidValue))
 	attr = appendU32(attr, uint32(len(encoded)))
 	attr = appendBytes(attr, encoded)
 	return attr, nil
@@ -1821,6 +2069,7 @@ func parseSuperExtendedDataFormat(payload []byte, meta *resultSetMeta) error {
 	meta.TimeFormat = int(timeFormat)
 	meta.DateSeparator = int(dateSeparator)
 	meta.TimeSeparator = int(timeSeparator)
+	meta.hasDataFormat = true
 	meta.RowSize = int(recordSize64)
 
 	if err := meta.ensureColumns(numFields); err != nil {
@@ -1948,6 +2197,7 @@ func parseSuperExtendedDataFormat(payload []byte, meta *resultSetMeta) error {
 			switch fieldCP {
 			case 0x3840:
 				meta.columns[i].Name = name
+				meta.columns[i].NameCCSID = int(fieldCCSID)
 			case 0x3841:
 				meta.columns[i].UDTName = name
 			}
@@ -2097,6 +2347,7 @@ func parseSQLCAFromPayload(payload []byte) (*sqlcaInfo, error) {
 	if state, err := decodeTextByCCSID(sqlcaBytes[131:136], 37); err == nil {
 		info.SQLState = strings.TrimSpace(state)
 	}
+	info.Tokens = sqlerrmcTokens(sqlcaBytes)
 	if info.SQLCode > 0 {
 		message := fmt.Sprintf("SQL warning %d", info.SQLCode)
 		if info.SQLState != "" {
@@ -2265,6 +2516,16 @@ func parseSuperExtendedParameterMarkerFormat(payload []byte) (*parameterMarkerFo
 }
 
 func decodeColumnValue(col columnMeta, row []byte) (driver.Value, error) {
+	return decodeColumnValueWithSettings(col, row, defaultDateTimeSettings())
+}
+
+func decodeColumnValueWithSettings(col columnMeta, row []byte, dt dateTimeSettings) (driver.Value, error) {
+	return decodeColumnValueWithBidi(col, row, dt, defaultBidiSettings())
+}
+
+// decodeColumnValueWithBidi decodes a column value with the connection's date and time
+// settings and bidi settings (the bidi layout applies to CHAR, VARCHAR and CLOB text).
+func decodeColumnValueWithBidi(col columnMeta, row []byte, dt dateTimeSettings, bs bidiSettings) (driver.Value, error) {
 	if len(row) < col.Offset {
 		return nil, fmt.Errorf("row offset out of range")
 	}
@@ -2276,40 +2537,39 @@ func decodeColumnValue(col columnMeta, row []byte) (driver.Value, error) {
 		}
 		length = len(row) - offset
 	}
-	raw := row[offset : offset+length]
+	raw, err := inlineLOBColumnData(col, row[offset:offset+length])
+	if err != nil {
+		return nil, err
+	}
 	switch col.db2Type() {
 	case db2TypeDate:
 		text, err := decodeTextByCCSID(raw, col.CCSID)
 		if err != nil {
 			return nil, err
 		}
-		s := strings.TrimSpace(text)
-		if t, err := time.Parse("2006-01-02", s); err == nil {
-			return t.UTC(), nil
-		}
-		return s, nil
+		return decodeDateText(strings.TrimSpace(text), dt)
 	case db2TypeTime:
 		text, err := decodeTextByCCSID(raw, col.CCSID)
 		if err != nil {
 			return nil, err
 		}
-		s := strings.TrimSpace(text)
-		if t, err := time.Parse("15.04.05", s); err == nil {
-			return t.UTC(), nil
-		}
-		return s, nil
+		return decodeTimeText(strings.TrimSpace(text), dt)
 	case db2TypeTimestamp:
 		text, err := decodeTextByCCSID(raw, col.CCSID)
 		if err != nil {
 			return nil, err
 		}
 		s := strings.TrimSpace(text)
+		if dt.TimestampString {
+			// timestampPrecision=string: keep every fractional digit the server sent.
+			return s, nil
+		}
 		if t, err := parseIBMiTimestamp(s); err == nil {
 			return t.UTC(), nil
 		}
 		return s, nil
 	case db2TypeChar:
-		text, err := decodeTextByCCSID(raw, col.CCSID)
+		text, err := decodeTextWithBidi(raw, col.CCSID, bs)
 		if err != nil {
 			return nil, err
 		}
@@ -2322,7 +2582,7 @@ func decodeColumnValue(col columnMeta, row []byte) (driver.Value, error) {
 		if valueLen > len(raw)-2 {
 			valueLen = len(raw) - 2
 		}
-		text, err := decodeTextByCCSID(raw[2:2+valueLen], col.CCSID)
+		text, err := decodeTextWithBidi(raw[2:2+valueLen], col.CCSID, bs)
 		if err != nil {
 			return nil, err
 		}
@@ -2398,10 +2658,14 @@ func decodeColumnValue(col columnMeta, row []byte) (driver.Value, error) {
 		default:
 			return nil, fmt.Errorf("unexpected DECFLOAT length %d", len(raw))
 		}
-	case db2TypeBlob, db2TypeClob, db2TypeDbclob, db2TypeXML:
+	case db2TypeBoolean:
+		return decodeBooleanValue(raw)
+	case db2TypeBlob:
 		out := make([]byte, len(raw))
 		copy(out, raw)
 		return out, nil
+	case db2TypeClob, db2TypeDbclob, db2TypeXML:
+		return decodeLobTextValueWithBidi(raw, col, bs)
 	default:
 		text, err := decodeTextByCCSID(raw, col.CCSID)
 		if err == nil {
@@ -2413,8 +2677,33 @@ func decodeColumnValue(col columnMeta, row []byte) (driver.Value, error) {
 	}
 }
 
+// decodeLobTextValue converts CLOB, DBCLOB and XML content to text in the
+// column CCSID. As in JTOpen, CCSID 65535 (no conversion; XML 65535 is
+// binary XML) keeps the raw bytes.
+func decodeLobTextValue(raw []byte, col columnMeta) (driver.Value, error) {
+	return decodeLobTextValueWithBidi(raw, col, defaultBidiSettings())
+}
+
+// decodeLobTextValueWithBidi is decodeLobTextValue with the connection's bidi settings.
+func decodeLobTextValueWithBidi(raw []byte, col columnMeta, bs bidiSettings) (driver.Value, error) {
+	if col.CCSID == 65535 {
+		out := make([]byte, len(raw))
+		copy(out, raw)
+		return out, nil
+	}
+	text, err := decodeTextWithBidi(raw, col.CCSID, bs)
+	if err != nil {
+		return nil, err
+	}
+	switch col.db2Type() {
+	case db2TypeXML, db2TypeXMLLocator:
+		text = strings.TrimPrefix(text, "\uFEFF")
+	}
+	return text, nil
+}
+
 func decodeColumnValueWithContext(ctx context.Context, conn *Conn, col columnMeta, row []byte) (driver.Value, error) {
-	value, err := decodeColumnValue(col, row)
+	value, err := decodeColumnValueWithSettings(col, row, dateTimeSettingsForConn(conn))
 	if err != nil {
 		return nil, err
 	}
@@ -2435,7 +2724,11 @@ func resolveLobLocatorValue(ctx context.Context, conn *Conn, col columnMeta, val
 		return value, nil
 	}
 	locatorHandle := binary.BigEndian.Uint32(raw[:4])
+	isText := col.db2Type() == db2TypeClobLocator || col.db2Type() == db2TypeDbclobLocator || col.db2Type() == db2TypeXMLLocator
 	if locatorHandle == 0 {
+		if isText {
+			return "", nil
+		}
 		return []byte(nil), nil
 	}
 	data, err := conn.retrieveLobData(ctx, locatorHandle)
@@ -2445,23 +2738,30 @@ func resolveLobLocatorValue(ctx context.Context, conn *Conn, col columnMeta, val
 	if err != nil {
 		return nil, err
 	}
+	if isText {
+		return decodeLobTextValueWithBidi(data, col, bidiSettingsForConn(conn))
+	}
 	return data, nil
 }
 
-func decodeTextByCCSID(data []byte, ccsid int) (string, error) {
+func decodeTextByCCSID(data []byte, id int) (string, error) {
 	if len(data) == 0 {
 		return "", nil
 	}
-	switch ccsid {
-	case 0, 37, 273, 65535:
-		return DecodeEBCDIC37(data)
-	case 1200, 13488:
-		return DecodeUTF16BE(data)
-	case 1208:
-		return string(data), nil
-	default:
-		return "", fmt.Errorf("%w: unsupported CCSID %d", ErrUnsupported, ccsid)
+	text, err := ccsid.Decode(data, textCCSID(id))
+	if errors.Is(err, ccsid.ErrUnsupported) {
+		return "", fmt.Errorf("%w: unsupported CCSID %d", ErrUnsupported, id)
 	}
+	return text, err
+}
+
+// textCCSID maps the "no conversion" CCSIDs 0 and 65535 to EBCDIC 37, the
+// driver's default when text must be produced from untagged data.
+func textCCSID(id int) int {
+	if id == 0 || id == 65535 {
+		return 37
+	}
+	return id
 }
 
 // decfloatUnpackDeclet decodes a 10-bit Densely Packed Decimal (DPD) declet
@@ -2698,9 +2998,19 @@ func decodePackedDecimalString(data []byte, precision, scale int) (string, error
 	for i, b := range data {
 		hi := (b >> 4) & 0x0F
 		lo := b & 0x0F
+		if hi > 0x09 {
+			return "", fmt.Errorf("invalid packed decimal digit nibble 0x%X", hi)
+		}
 		if i < len(data)-1 {
+			if lo > 0x09 {
+				return "", fmt.Errorf("invalid packed decimal digit nibble 0x%X", lo)
+			}
 			digits = append(digits, digitNibble(hi), digitNibble(lo))
 		} else {
+			// Sign nibble: 0xA-0xF are valid (0xB/0xD negative), as in JTOpen.
+			if lo < 0x0A {
+				return "", fmt.Errorf("invalid packed decimal sign nibble 0x%X", lo)
+			}
 			digits = append(digits, digitNibble(hi))
 			sign = lo
 		}
@@ -2727,7 +3037,7 @@ func decodePackedDecimalString(data []byte, precision, scale int) (string, error
 		digits = append(digits[:point], append([]byte{'.'}, digits[point:]...)...)
 	}
 	prefix := ""
-	if sign == 0x0D {
+	if sign == 0x0B || sign == 0x0D {
 		prefix = "-"
 	}
 	return prefix + string(digits), nil
@@ -2812,6 +3122,11 @@ type lobWriteRequest struct {
 }
 
 func buildParameterBindings(format *parameterMarkerFormat, args []driver.NamedValue) ([]parameterBinding, error) {
+	return buildParameterBindingsWithBidi(format, args, defaultBidiSettings())
+}
+
+// buildParameterBindingsWithBidi is buildParameterBindings with the connection's bidi settings.
+func buildParameterBindingsWithBidi(format *parameterMarkerFormat, args []driver.NamedValue, bs bidiSettings) ([]parameterBinding, error) {
 	if len(args) == 0 {
 		return nil, nil
 	}
@@ -2825,6 +3140,7 @@ func buildParameterBindings(format *parameterMarkerFormat, args []driver.NamedVa
 	bindings := make([]parameterBinding, len(format.Fields))
 	for i := range format.Fields {
 		field := format.Fields[i]
+		field.bidi = &bs
 		parameterType := byte(field.ParameterType & 0xFF)
 		if parameterType != 0x00 && parameterType != 0xF0 && parameterType != 0xF1 && parameterType != 0xF2 {
 			return nil, bindingError(i, "parameter mode", errPreparedStatementBindingUnsupported)
@@ -2906,6 +3222,10 @@ func isLOBParameterField(field parameterMarkerField) bool {
 
 func encodeLOBParameterValue(field parameterMarkerField, value any, hasInputValue bool, isNull bool) ([]byte, *lobWriteRequest, error) {
 	if field.LOBLocator <= 0 {
+		if isInlineLOBParameterField(field) {
+			raw, err := encodeInlineLOBParameterValue(field, value, hasInputValue, isNull)
+			return raw, nil, err
+		}
 		return nil, nil, errPreparedStatementBindingUnsupported
 	}
 	raw := make([]byte, 4)
@@ -2930,14 +3250,14 @@ func encodeLOBParameterValue(field parameterMarkerField, value any, hasInputValu
 		var text string
 		text, err = parameterFieldValueString(valueArg)
 		if err == nil {
-			data, err = encodeTextBytes(text, field.CCSID)
+			data, err = encodeTextWithBidi(text, field.CCSID, field.textBidi())
 			requestedSize = len(data)
 		}
 	case db2TypeDbclob:
 		var text string
 		text, err = parameterFieldValueString(valueArg)
 		if err == nil {
-			data, err = encodeTextBytes(text, field.CCSID)
+			data, err = encodeTextWithBidi(text, field.CCSID, field.textBidi())
 			requestedSize = len(data) / 2
 		}
 	default:
@@ -2991,13 +3311,20 @@ func parameterFieldBinaryBytes(value driver.Value) ([]byte, error) {
 		copy(out, v)
 		return out, nil
 	case string:
+		// Mirrors JTOpen BinaryConverter.stringToBytes: accepts "0x" and
+		// X'...' prefixes and left-pads odd-length input with a zero digit.
 		text := strings.TrimSpace(v)
 		if strings.HasPrefix(text, "0x") || strings.HasPrefix(text, "0X") {
 			text = text[2:]
+		} else if len(text) > 2 && (text[0] == 'x' || text[0] == 'X') && text[1] == '\'' {
+			if text[len(text)-1] != '\'' {
+				return nil, fmt.Errorf("invalid hex literal %q", v)
+			}
+			text = text[2 : len(text)-1]
 		}
 		text = strings.ReplaceAll(text, " ", "")
 		if len(text)%2 != 0 {
-			return nil, fmt.Errorf("hex string must contain an even number of digits")
+			text = "0" + text
 		}
 		out, err := hex.DecodeString(text)
 		if err != nil {
@@ -3066,7 +3393,9 @@ func encodeParameterValue(field parameterMarkerField, value driver.Value, isNull
 	case db2TypeGraphic:
 		return encodeGraphicParameter(value, field)
 	case db2TypeDecfloat:
-		return encodeFixedTextParameter(value, field)
+		return encodeDecfloatParameter(value, field)
+	case db2TypeBoolean:
+		return encodeBooleanParameter(value)
 	case db2TypeBlob, db2TypeClob, db2TypeDbclob, db2TypeXML,
 		db2TypeBlobLocator, db2TypeClobLocator, db2TypeDbclobLocator,
 		db2TypeXMLLocator:
@@ -3087,6 +3416,8 @@ func parameterFieldNullLength(field parameterMarkerField) int {
 		return 4
 	case db2TypeSmallint:
 		return 2
+	case db2TypeBoolean:
+		return 1
 	case db2TypeFloatingPoint:
 		if field.Length == 4 {
 			return 4
@@ -3100,6 +3431,11 @@ func parameterFieldNullLength(field parameterMarkerField) int {
 		if field.Precision > 0 {
 			return field.Precision
 		}
+	case db2TypeDecfloat:
+		if field.Precision == 34 {
+			return 16
+		}
+		return 8
 	case db2TypeVarbinary, db2TypeRowID, db2TypeVarchar, db2TypeLongVarchar,
 		db2TypeDatalink, db2TypeVarGraphic, db2TypeLongVarGraphic:
 		return 0
@@ -3375,7 +3711,7 @@ func outputValueBytes(value driver.Value) ([]byte, error) {
 func encodeBigintParameter(value driver.Value, field parameterMarkerField) ([]byte, error) {
 	number, err := parameterFieldInt64(value)
 	if err != nil {
-		return nil, err
+		return nil, numericParameterError(value, "BIGINT", err)
 	}
 	size := parameterFieldNullLength(field)
 	if size < 8 {
@@ -3389,10 +3725,10 @@ func encodeBigintParameter(value driver.Value, field parameterMarkerField) ([]by
 func encodeIntegerParameter(value driver.Value, field parameterMarkerField) ([]byte, error) {
 	number, err := parameterFieldInt64(value)
 	if err != nil {
-		return nil, err
+		return nil, numericParameterError(value, "INTEGER", err)
 	}
 	if number < math.MinInt32 || number > math.MaxInt32 {
-		return nil, fmt.Errorf("integer value out of range")
+		return nil, fmt.Errorf("parameter value %v out of range for INTEGER", number)
 	}
 	size := parameterFieldNullLength(field)
 	if size < 4 {
@@ -3406,10 +3742,10 @@ func encodeIntegerParameter(value driver.Value, field parameterMarkerField) ([]b
 func encodeSmallintParameter(value driver.Value, field parameterMarkerField) ([]byte, error) {
 	number, err := parameterFieldInt64(value)
 	if err != nil {
-		return nil, err
+		return nil, numericParameterError(value, "SMALLINT", err)
 	}
 	if number < math.MinInt16 || number > math.MaxInt16 {
-		return nil, fmt.Errorf("smallint value out of range")
+		return nil, fmt.Errorf("parameter value %v out of range for SMALLINT", number)
 	}
 	size := parameterFieldNullLength(field)
 	if size < 2 {
@@ -3423,7 +3759,10 @@ func encodeSmallintParameter(value driver.Value, field parameterMarkerField) ([]
 func encodeFloatingPointParameter(value driver.Value, field parameterMarkerField) ([]byte, error) {
 	number, err := parameterFieldFloat64(value)
 	if err != nil {
-		return nil, err
+		if field.Length == 4 {
+			return nil, numericParameterError(value, "REAL", err)
+		}
+		return nil, numericParameterError(value, "DOUBLE", err)
 	}
 	if field.Length == 4 {
 		buf := make([]byte, 4)
@@ -3448,9 +3787,13 @@ func encodePackedOrZonedDecimalParameter(value driver.Value, field parameterMark
 	if err != nil {
 		return nil, err
 	}
+	typeName := "NUMERIC"
+	if packed {
+		typeName = "DECIMAL"
+	}
 	normalized, negative, err := normalizeDecimalText(text, field.Scale)
 	if err != nil {
-		return nil, err
+		return nil, numericParameterError(value, typeName, err)
 	}
 	if field.Precision > 0 && len(normalized) > field.Precision {
 		return nil, fmt.Errorf("decimal value out of range")
@@ -3482,6 +3825,14 @@ func encodeTimestampParameter(value driver.Value, field parameterMarkerField) ([
 	if err != nil {
 		return nil, err
 	}
+	// Mirrors JTOpen SQLTimestamp.convertToRawBytes, which truncates the
+	// formatted value to the column length (dropping fractional digits that
+	// do not fit, e.g. TIMESTAMP(6) has length 26).
+	if field.Length > 0 {
+		if runes := []rune(text); len(runes) > field.Length {
+			text = string(runes[:field.Length])
+		}
+	}
 	return encodeFixedTextBytes(text, field)
 }
 
@@ -3500,6 +3851,9 @@ func encodeVarbinaryParameter(value driver.Value, field parameterMarkerField) ([
 	}
 	if field.Length > 0 && len(raw)+2 > field.Length {
 		return nil, fmt.Errorf("parameter value too long")
+	}
+	if len(raw) > math.MaxUint16 {
+		return nil, fmt.Errorf("parameter value too long for 2-byte length prefix")
 	}
 	buf := make([]byte, 2+len(raw))
 	binary.BigEndian.PutUint16(buf[:2], uint16(len(raw)))
@@ -3520,12 +3874,15 @@ func encodeVarcharParameter(value driver.Value, field parameterMarkerField) ([]b
 	if err != nil {
 		return nil, err
 	}
-	raw, err := encodeTextBytes(text, field.CCSID)
+	raw, err := encodeTextWithBidi(text, field.CCSID, field.textBidi())
 	if err != nil {
 		return nil, err
 	}
 	if field.Length > 0 && len(raw)+2 > field.Length {
 		return nil, fmt.Errorf("parameter value too long")
+	}
+	if len(raw) > math.MaxUint16 {
+		return nil, fmt.Errorf("parameter value too long for 2-byte length prefix")
 	}
 	buf := make([]byte, 2+len(raw))
 	binary.BigEndian.PutUint16(buf[:2], uint16(len(raw)))
@@ -3548,6 +3905,9 @@ func encodeVarGraphicParameter(value driver.Value, field parameterMarkerField) (
 	if field.Length > 0 && len(raw)+2 > field.Length {
 		return nil, fmt.Errorf("parameter value too long")
 	}
+	if len(raw)/2 > math.MaxUint16 {
+		return nil, fmt.Errorf("parameter value too long for 2-byte length prefix")
+	}
 	buf := make([]byte, 2+len(raw))
 	binary.BigEndian.PutUint16(buf[:2], uint16(len(raw)/2))
 	copy(buf[2:], raw)
@@ -3563,7 +3923,7 @@ func encodeGraphicParameter(value driver.Value, field parameterMarkerField) ([]b
 }
 
 func encodeFixedTextBytes(text string, field parameterMarkerField) ([]byte, error) {
-	raw, err := encodeTextBytes(text, field.CCSID)
+	raw, err := encodeTextWithBidi(text, field.CCSID, field.textBidi())
 	if err != nil {
 		return nil, err
 	}
@@ -3576,37 +3936,23 @@ func encodeFixedTextBytes(text string, field parameterMarkerField) ([]byte, erro
 	return fitTextBytesToLength(raw, field.Length, field.CCSID), nil
 }
 
-func encodeTextBytes(text string, ccsid int) ([]byte, error) {
-	switch ccsid {
-	case 0, 37, 273, 65535:
-		return EncodeEBCDIC37(text)
-	case 1200, 13488:
-		return EncodeUTF16BE(text), nil
-	case 1208:
-		return []byte(text), nil
-	default:
-		return nil, fmt.Errorf("%w: unsupported CCSID %d", ErrUnsupported, ccsid)
+func encodeTextBytes(text string, id int) ([]byte, error) {
+	encoded, err := ccsid.Encode(text, textCCSID(id))
+	if errors.Is(err, ccsid.ErrUnsupported) {
+		return nil, fmt.Errorf("%w: unsupported CCSID %d", ErrUnsupported, id)
 	}
+	return encoded, err
 }
 
-func fitTextBytesToLength(raw []byte, length int, ccsid int) []byte {
+// fitTextBytesToLength pads raw to length with the CCSID's blank character.
+func fitTextBytesToLength(raw []byte, length int, id int) []byte {
 	out := make([]byte, length)
-	switch ccsid {
-	case 1200, 13488:
-		for i := range out {
-			out[i] = 0x00
-		}
-		for i := 0; i < length/2; i++ {
-			binary.BigEndian.PutUint16(out[i*2:], uint16(' '))
-		}
-	case 1208:
-		for i := range out {
-			out[i] = 0x20
-		}
-	default:
-		for i := range out {
-			out[i] = 0x40
-		}
+	space := []byte{0x40}
+	if codec, err := ccsid.Lookup(textCCSID(id)); err == nil {
+		space = codec.Space()
+	}
+	for i := 0; i+len(space) <= length; i += len(space) {
+		copy(out[i:], space)
 	}
 	copy(out, raw)
 	return out
@@ -3631,7 +3977,7 @@ func parameterFieldInt64(value driver.Value) (int64, error) {
 	case int64:
 		return v, nil
 	case float64:
-		return int64(v), nil
+		return parameterFieldFloat64ToInt64(v)
 	case bool:
 		if v {
 			return 1, nil
@@ -3673,14 +4019,92 @@ func parameterFieldFloat64(value driver.Value) (float64, error) {
 func parameterFieldDecimalFloat(text string) (int64, error) {
 	text = strings.TrimSpace(text)
 	if text == "" {
+		return 0, errInvalidNumericText
+	}
+	negative := false
+	switch text[0] {
+	case '+':
+		text = text[1:]
+	case '-':
+		negative = true
+		text = text[1:]
+	}
+	mantissa, exponentText, hasExponent := text, "", false
+	if i := strings.IndexAny(text, "eE"); i >= 0 {
+		mantissa, exponentText, hasExponent = text[:i], text[i+1:], true
+	}
+	intPart, fracPart := mantissa, ""
+	if i := strings.IndexByte(mantissa, '.'); i >= 0 {
+		intPart, fracPart = mantissa[:i], mantissa[i+1:]
+	}
+	if (intPart == "" && fracPart == "") || !isASCIIDigits(intPart) || !isASCIIDigits(fracPart) {
+		return 0, errInvalidNumericText
+	}
+	exp := 0
+	if hasExponent {
+		body := strings.TrimLeft(exponentText, "+-")
+		if body == "" || len(exponentText)-len(body) > 1 || !isASCIIDigits(body) {
+			return 0, errInvalidNumericText
+		}
+		e, err := strconv.Atoi(exponentText)
+		if err != nil || e > 100000 || e < -100000 {
+			// Exponent too large to represent: only zero mantissas are valid.
+			if strings.Trim(intPart+fracPart, "0") == "" {
+				return 0, nil
+			}
+			return 0, fmt.Errorf("parameter value %q is not a representable integer", text)
+		}
+		exp = e
+	}
+	// Normalize to significant digits d and a power of ten exp, so value = d * 10^exp.
+	digits := strings.TrimLeft(intPart+fracPart, "0")
+	if digits == "" {
 		return 0, nil
 	}
-	parsed, _, err := big.ParseFloat(text, 10, 256, big.ToZero)
-	if err != nil {
-		return 0, err
+	exp -= len(fracPart)
+	trimmed := strings.TrimRight(digits, "0")
+	exp += len(digits) - len(trimmed)
+	digits = trimmed
+	if exp < 0 {
+		return 0, fmt.Errorf("parameter value %q is not an integer", text)
 	}
-	value, _ := parsed.Int64()
+	if len(digits)+exp > 19 {
+		return 0, fmt.Errorf("parameter value %q out of range for 64-bit integer", text)
+	}
+	s := digits + strings.Repeat("0", exp)
+	if negative {
+		s = "-" + s
+	}
+	value, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parameter value %q out of range for 64-bit integer", text)
+	}
 	return value, nil
+}
+
+// parameterFieldFloat64ToInt64 converts a float64 to int64 only when it is finite,
+// integral and within the int64 range. It never truncates or wraps.
+func parameterFieldFloat64ToInt64(v float64) (int64, error) {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("parameter value %v is not a finite number", v)
+	}
+	if v != math.Trunc(v) {
+		return 0, fmt.Errorf("parameter value %v is not an integer", v)
+	}
+	// float64(math.MaxInt64) rounds up to 2^63, so the upper bound is exclusive.
+	if v < -(1<<63) || v >= (1<<63) {
+		return 0, fmt.Errorf("parameter value %v out of range for 64-bit integer", v)
+	}
+	return int64(v), nil
+}
+
+func isASCIIDigits(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // parseIBMiTimestamp parses the IBM i TIMESTAMP wire format "YYYY-MM-DD-HH.MM.SS[.fraction]"
@@ -3730,29 +4154,9 @@ func parameterFieldTimestampText(value driver.Value) (string, error) {
 	}
 }
 
+// normalizeDecimalText is implemented in numeric_param.go.
 func normalizeDecimalText(text string, scale int) (string, bool, error) {
-	parsed, _, err := big.ParseFloat(strings.TrimSpace(text), 10, 256, big.ToZero)
-	if err != nil {
-		return "", false, err
-	}
-	formatted := parsed.Text('f', scale)
-	negative := strings.HasPrefix(formatted, "-")
-	if negative || strings.HasPrefix(formatted, "+") {
-		formatted = formatted[1:]
-	}
-	parts := strings.SplitN(formatted, ".", 2)
-	integerPart := strings.TrimLeft(parts[0], "0")
-	fractionPart := ""
-	if len(parts) == 2 {
-		fractionPart = parts[1]
-	}
-	if integerPart == "" {
-		if fractionPart == "" {
-			return "0", negative, nil
-		}
-		return fractionPart, negative, nil
-	}
-	return integerPart + fractionPart, negative, nil
+	return decimalTextDigits(text, scale)
 }
 
 func packDecimalDigits(digits string, negative bool, field parameterMarkerField) []byte {
@@ -3961,7 +4365,7 @@ func buildDeleteDescriptorRequest(statementHandle, descriptorHandle uint16) []by
 	return appendRequestTemplate(request, orsSendReplyImmediately|orsSQLCA, statementHandle, descriptorHandle, 0)
 }
 
-func buildExecutePreparedRequest(statementHandle, descriptorHandle uint16, statementType int, format *parameterMarkerFormat, bindings []parameterBinding) ([]byte, error) {
+func buildExecutePreparedRequest(statementHandle, descriptorHandle uint16, statementType int, format *parameterMarkerFormat, bindings []parameterBinding, pkg *packageSpec) ([]byte, error) {
 	dataPayload, dataCodePoint, err := buildParameterMarkerDataPayload(format, bindings)
 	if err != nil {
 		return nil, err
@@ -3969,13 +4373,15 @@ func buildExecutePreparedRequest(statementHandle, descriptorHandle uint16, state
 	body := make([]byte, 0, len(dataPayload)+16)
 	body = appendShortAttribute(body, 0x3812, uint16(statementType))
 	body = append(body, AppendLLCP(nil, dataCodePoint, dataPayload)...)
+	parms := 2
+	body, parms = pkg.appendExecuteAttributes(body, parms)
 	length := 40 + len(body)
 	request := buildHeader(uint32(length), 0, DatabaseServerID, 20, FunctionExecute)
 	templateBitmap := orsSendReplyImmediately | orsSQLCA
 	if statementType == sqlStatementTypeCall && hasOutputBindings(bindings) {
 		templateBitmap |= orsResultData
 	}
-	request = appendRequestTemplate(request, templateBitmap, statementHandle, descriptorHandle, 2)
+	request = appendRequestTemplate(request, templateBitmap, statementHandle, descriptorHandle, parms)
 	request = append(request, body...)
 	return request, nil
 }
@@ -4006,14 +4412,11 @@ func (c *Conn) writeLOBData(ctx context.Context, write *lobWriteRequest) error {
 	if write == nil {
 		return nil
 	}
-	envelope, _, err := c.doRequest(ctx, buildWriteLOBDataRequest(write))
+	envelope, payload, err := c.doRequest(ctx, buildWriteLOBDataRequest(write))
 	if err != nil {
 		return err
 	}
-	if envelope.hasError() {
-		return newProtocolError("write LOB data", envelope)
-	}
-	return nil
+	return c.checkReply(ctx, 0, "write LOB data", envelope, payload)
 }
 
 func (c *Conn) writeLOBDataRequests(ctx context.Context, bindings []parameterBinding) error {
@@ -4045,25 +4448,34 @@ func buildFreeLobRequest(locatorHandle uint32) []byte {
 	return append(request, body...)
 }
 
-func parseCurrentLobLengthFromPayload(payload []byte) int64 {
+// parseCurrentLobLengthFromPayload returns the CurrentLOBLength code point value.
+// It returns -1 with a nil error when the code point is absent, and an error for
+// malformed LLCP framing, a payload of unexpected size, or a length that does not
+// fit in int64.
+func parseCurrentLobLengthFromPayload(payload []byte) (int64, error) {
 	remaining := payload
 	for len(remaining) > 0 {
 		codePoint, cpPayload, rest, err := ParseLLCP(remaining)
 		if err != nil {
-			return -1
+			return -1, newWireError("parse LOB length", err)
 		}
 		if codePoint == CodePointCurrentLOBLength {
-			if len(cpPayload) == 6 {
-				return int64(binary.BigEndian.Uint32(cpPayload[2:6]))
+			switch len(cpPayload) {
+			case 6:
+				return int64(binary.BigEndian.Uint32(cpPayload[2:6])), nil
+			case 10:
+				length := binary.BigEndian.Uint64(cpPayload[2:10])
+				if length > math.MaxInt64 {
+					return -1, newWireError("parse LOB length", fmt.Errorf("length %d exceeds int64", length))
+				}
+				return int64(length), nil
+			default:
+				return -1, newWireError("parse LOB length", fmt.Errorf("unexpected payload length %d", len(cpPayload)))
 			}
-			if len(cpPayload) >= 10 {
-				return int64(binary.BigEndian.Uint64(cpPayload[2:10]))
-			}
-			return 0
 		}
 		remaining = rest
 	}
-	return -1
+	return -1, nil
 }
 
 func parseLobDataFromPayload(payload []byte) ([]byte, error) {
@@ -4095,10 +4507,13 @@ func (c *Conn) retrieveLobData(ctx context.Context, locatorHandle uint32) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	if lengthEnvelope.hasError() {
-		return nil, newProtocolError("retrieve LOB length", lengthEnvelope)
+	if err := c.checkReply(ctx, 0, "retrieve LOB length", lengthEnvelope, lengthPayload); err != nil {
+		return nil, err
 	}
-	currentLength := parseCurrentLobLengthFromPayload(lengthPayload)
+	currentLength, err := parseCurrentLobLengthFromPayload(lengthPayload)
+	if err != nil {
+		return nil, err
+	}
 	if currentLength <= 0 {
 		return []byte(nil), nil
 	}
@@ -4109,8 +4524,8 @@ func (c *Conn) retrieveLobData(ctx context.Context, locatorHandle uint32) ([]byt
 	if err != nil {
 		return nil, err
 	}
-	if envelope.hasError() {
-		return nil, newProtocolError("retrieve LOB data", envelope)
+	if err := c.checkReply(ctx, 0, "retrieve LOB data", envelope, payload); err != nil {
+		return nil, err
 	}
 	data, err := parseLobDataFromPayload(payload)
 	if err != nil {
@@ -4123,17 +4538,14 @@ func (c *Conn) freeLob(ctx context.Context, locatorHandle uint32) error {
 	if locatorHandle == 0 {
 		return nil
 	}
-	envelope, _, err := c.doRequest(ctx, buildFreeLobRequest(locatorHandle))
+	envelope, payload, err := c.doRequest(ctx, buildFreeLobRequest(locatorHandle))
 	if err != nil {
 		return err
 	}
-	if envelope.hasError() {
-		return newProtocolError("free LOB", envelope)
-	}
-	return nil
+	return c.checkReply(ctx, 0, "free LOB", envelope, payload)
 }
 
-func buildOpenDescribePreparedRequest(statementHandle, descriptorHandle uint16, statementName, cursorName string, format *parameterMarkerFormat, bindings []parameterBinding, scrollable, hold bool) ([]byte, error) {
+func buildOpenDescribePreparedRequest(statementHandle, descriptorHandle uint16, statementName, cursorName string, format *parameterMarkerFormat, bindings []parameterBinding, scrollable, hold bool, pkg *packageSpec) ([]byte, error) {
 	body := make([]byte, 0, 256)
 	parms := 0
 
@@ -4150,6 +4562,7 @@ func buildOpenDescribePreparedRequest(statementHandle, descriptorHandle uint16, 
 	}
 	body = append(body, cursorAttr...)
 	parms++
+	body, parms = pkg.appendExecuteAttributes(body, parms)
 
 	body = appendByteAttribute(body, 0x3809, 0x80)
 	parms++

@@ -32,11 +32,16 @@ type Conn struct {
 	statementCacheMu         sync.Mutex
 	statementCache           map[string]*cachedStatement
 	statementCacheOrder      []string
+	pkg                      *packageState // extended dynamic (SQL package) state; nil when disabled
 	statementSeq             uint32
+	usedStatementHandles     map[uint16]struct{} // statement ids in use (guarded by nameMu)
 	descriptorSeq            uint32
 	cursorSeq                uint32
+	defaultCursorBusy        map[uint16]bool // statements whose default cursor name is open (guarded by nameMu)
 	closed                   bool
 	closeErr                 error
+	clientInfo               map[string]string // runtime SetClientInfo values; nil when none
+	rpbTimeouts              map[uint16]int32  // last 0x3817 value sent per statement RPB (qqrytimlmt)
 }
 
 type cachedStatement struct {
@@ -96,7 +101,15 @@ func openConn(ctx context.Context, cfg Config) (*Conn, error) {
 		return nil, err
 	}
 
-	return &Conn{cfg: cfg, netConn: dbConn, systemInfo: info, jobName: jobName, autoCommit: true, currentCommitmentControl: cfg.CommitmentControl, statementCache: make(map[string]*cachedStatement)}, nil
+	pkg, pkgWarning, err := newPackageState(cfg)
+	if err != nil {
+		_ = dbConn.Close()
+		return nil, err
+	}
+
+	conn := &Conn{cfg: cfg, netConn: dbConn, systemInfo: info, jobName: jobName, autoCommit: true, currentCommitmentControl: cfg.CommitmentControl, statementCache: make(map[string]*cachedStatement), pkg: pkg}
+	conn.recordWarning(pkgWarning)
+	return conn, nil
 }
 
 func (c *Conn) Close() error {
@@ -192,6 +205,9 @@ func (c *Conn) ResetSession(ctx context.Context) error {
 	if err := c.setServerAttributes(ctx, true); err != nil {
 		return err
 	}
+	if err := c.restoreClientInfo(ctx); err != nil {
+		return err
+	}
 	return c.addConfiguredLibraries(ctx)
 }
 
@@ -246,6 +262,9 @@ func (c *Conn) recordWarning(warning *SQLWarning) {
 func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	if !c.IsValid() {
 		return nil, driver.ErrBadConn
+	}
+	if c.cfg.ReturnGeneratedKeys && isInsertStatement(query) {
+		return c.execInsertWithGeneratedKey(ctx, query, args)
 	}
 	if len(args) == 0 {
 		return c.execContext(ctx, query, nil)
@@ -381,7 +400,11 @@ func (c *Conn) currentCommitmentMode() int {
 }
 
 func (c *Conn) setServerAttributes(ctx context.Context, autoCommit bool) error {
-	request, err := buildSetServerAttributesRequest(c.cfg, autoCommit, c.currentCommitmentMode())
+	serverVRM := 0
+	if c.systemInfo != nil {
+		serverVRM = c.systemInfo.ServerVersion
+	}
+	request, err := buildSetServerAttributesRequestVRM(c.cfg, autoCommit, c.currentCommitmentMode(), serverVRM)
 	if err != nil {
 		return err
 	}
@@ -426,12 +449,17 @@ func (c *Conn) prepareStmt(ctx context.Context, query string) (driver.Stmt, erro
 	if err != nil {
 		return nil, err
 	}
-	statementName, statementHandle := c.nextStatementName()
-	statementType := classifySQLStatement(rewritten)
-	_, parameterFormat, err := c.prepareAndDescribe(ctx, statementHandle, statementName, rewritten)
+	statementName, statementHandle, err := c.nextStatementName()
 	if err != nil {
 		return nil, err
 	}
+	statementType := classifySQLStatement(rewritten)
+	preparedName, parameterFormat, err := c.prepareOrReuse(ctx, statementHandle, statementName, rewritten)
+	if err != nil {
+		c.discardStatement(ctx, statementName, statementHandle)
+		return nil, err
+	}
+	statementName = preparedName
 	return newStmt(c, rewritten, statementName, statementHandle, statementType, parameterFormat, paramNames), nil
 }
 
@@ -471,7 +499,7 @@ func (c *Conn) cachedPreparedStatement(ctx context.Context, query string) (*cach
 	if existing := c.statementCache[query]; existing != nil {
 		existing.refs++
 		c.statementCacheMu.Unlock()
-		_ = c.closePreparedStatement(context.Background(), statementName)
+		_ = c.closePreparedStatement(context.Background(), statementName, statementHandle)
 		return existing, nil
 	}
 	if len(c.statementCache) >= c.cfg.StatementCacheSize {
@@ -481,7 +509,9 @@ func (c *Conn) cachedPreparedStatement(ctx context.Context, query string) (*cach
 		delete(c.statementCache, key)
 		c.statementCacheOrder = c.statementCacheOrder[1:]
 		if victim.refs == 0 {
-			go func() { _ = c.closePreparedStatement(context.Background(), victim.statementName) }()
+			go func() {
+				_ = c.closePreparedStatement(context.Background(), victim.statementName, victim.statementHandle)
+			}()
 		}
 	}
 	cached.refs = 1
@@ -496,16 +526,18 @@ func (c *Conn) releaseCachedStatement(statement *cachedStatement) {
 		return
 	}
 	var closeName string
+	var closeHandle uint16
 	c.statementCacheMu.Lock()
 	if statement.refs > 0 {
 		statement.refs--
 	}
 	if statement.evicted && statement.refs == 0 {
 		closeName = statement.statementName
+		closeHandle = statement.statementHandle
 	}
 	c.statementCacheMu.Unlock()
 	if closeName != "" {
-		_ = c.closePreparedStatement(context.Background(), closeName)
+		_ = c.closePreparedStatement(context.Background(), closeName, closeHandle)
 	}
 }
 
@@ -534,6 +566,7 @@ func (c *Conn) queryPreparedCached(ctx context.Context, query string, args []dri
 		c.releaseCachedStatement(statement)
 		return nil, err
 	}
+	markStoredProcResult(rows, statement.statementType)
 	if preparedRows, ok := rows.(*queryRows); ok {
 		preparedRows.releaseStmt = func() { c.releaseCachedStatement(statement) }
 	} else {
@@ -548,21 +581,22 @@ func (c *Conn) execPreparedTransient(ctx context.Context, query string, args []d
 		return nil, err
 	}
 	defer func() {
-		_ = c.closePreparedStatement(context.Background(), statementName)
+		_ = c.closePreparedStatement(context.Background(), statementName, statementHandle)
 	}()
 	return c.execPrepared(ctx, statementHandle, statementType, parameterFormat, args)
 }
 
 func (c *Conn) queryPreparedTransient(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	_, statementHandle, statementName, parameterFormat, err := c.prepareTransientStatement(ctx, query)
+	statementType, statementHandle, statementName, parameterFormat, err := c.prepareTransientStatement(ctx, query)
 	if err != nil {
 		return nil, err
 	}
 	rows, err := c.queryPreparedWithArgs(ctx, statementHandle, statementName, parameterFormat, args)
 	if err != nil {
-		_ = c.closePreparedStatement(context.Background(), statementName)
+		_ = c.closePreparedStatement(context.Background(), statementName, statementHandle)
 		return nil, err
 	}
+	markStoredProcResult(rows, statementType)
 	if preparedRows, ok := rows.(*queryRows); ok {
 		preparedRows.ownStatement = true
 	}
@@ -574,10 +608,15 @@ func (c *Conn) prepareTransientStatement(ctx context.Context, query string) (int
 		ctx = context.Background()
 	}
 	statementType := classifySQLStatement(query)
-	statementName, statementHandle := c.nextStatementName()
-	_, parameterFormat, err := c.prepareAndDescribe(ctx, statementHandle, statementName, query)
+	statementName, statementHandle, err := c.nextStatementName()
 	if err != nil {
 		return 0, 0, "", nil, err
 	}
+	preparedName, parameterFormat, err := c.prepareOrReuse(ctx, statementHandle, statementName, query)
+	if err != nil {
+		c.discardStatement(ctx, statementName, statementHandle)
+		return 0, 0, "", nil, err
+	}
+	statementName = preparedName
 	return statementType, statementHandle, statementName, parameterFormat, nil
 }

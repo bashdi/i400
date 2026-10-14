@@ -19,14 +19,24 @@ func clearConnDeadline(conn net.Conn) {
 	_ = conn.SetDeadline(time.Time{})
 }
 
+// maxPacketLength bounds the length a peer may announce for one host-server
+// packet. The largest legitimate payloads are fetch blocks (at most 16000 KB)
+// and inline LOB data (at most 15 MiB, see maxLOBThreshold), so 1 GiB leaves
+// generous headroom while preventing a corrupt or hostile length prefix from
+// forcing a multi-gigabyte allocation.
+const maxPacketLength = 1 << 30
+
 func readPacket(conn net.Conn) ([]byte, error) {
 	var lengthBuf [4]byte
 	if _, err := io.ReadFull(conn, lengthBuf[:]); err != nil {
 		return nil, &WireError{Operation: "read packet length", Err: err}
 	}
 	length := binary.BigEndian.Uint32(lengthBuf[:])
-	if length < 4 {
-		return nil, &WireError{Operation: "validate packet length", Err: fmt.Errorf("invalid packet length: %d", length)}
+	if length < HeaderSize {
+		return nil, &WireError{Operation: "validate packet length", Err: fmt.Errorf("invalid packet length: %d (minimum %d)", length, HeaderSize)}
+	}
+	if length > maxPacketLength {
+		return nil, &WireError{Operation: "validate packet length", Err: fmt.Errorf("packet length %d exceeds maximum %d", length, maxPacketLength)}
 	}
 	packet := make([]byte, length)
 	copy(packet, lengthBuf[:])

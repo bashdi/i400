@@ -29,7 +29,7 @@ func TestBuildTestConnectionRequest(t *testing.T) {
 }
 
 func TestBuildPrepareAndDescribeRequestIncludesParameterMarkerFormat(t *testing.T) {
-	request, err := buildPrepareAndDescribeRequest(0x1234, "STMT0001", "values 1")
+	request, err := buildPrepareAndDescribeRequest(0x1234, "STMT0001", "values 1", nil)
 	if err != nil {
 		t.Fatalf("buildPrepareAndDescribeRequest() error = %v", err)
 	}
@@ -73,7 +73,7 @@ func TestBuildPreparedExecuteRequestsIncludeDescriptorAndData(t *testing.T) {
 		t.Fatalf("change request pm handle = 0x%x, want 0x5678", got)
 	}
 
-	executeRequest, err := buildExecutePreparedRequest(0x1234, 0x5678, sqlStatementTypeInsertUpdateDelete, format, bindings)
+	executeRequest, err := buildExecutePreparedRequest(0x1234, 0x5678, sqlStatementTypeInsertUpdateDelete, format, bindings, nil)
 	if err != nil {
 		t.Fatalf("buildExecutePreparedRequest() error = %v", err)
 	}
@@ -249,7 +249,7 @@ func TestQueryRowsColumnMetadataLobFallbacks(t *testing.T) {
 
 func TestBuildParameterlessPreparedExecuteRequest(t *testing.T) {
 	format := &parameterMarkerFormat{codePoint: CodePointParameterMarkerFormat}
-	request, err := buildExecutePreparedRequest(0x1234, 0, sqlStatementTypeInsertUpdateDelete, format, nil)
+	request, err := buildExecutePreparedRequest(0x1234, 0, sqlStatementTypeInsertUpdateDelete, format, nil, nil)
 	if err != nil {
 		t.Fatalf("buildExecutePreparedRequest() error = %v", err)
 	}
@@ -297,7 +297,7 @@ func TestBuildFetchRequestScrollOptions(t *testing.T) {
 }
 
 func TestBuildOpenDescribeRequestHoldability(t *testing.T) {
-	request, err := buildOpenDescribePreparedRequest(1, 0, "STMT0001", "CRSR0001", nil, nil, true, true)
+	request, err := buildOpenDescribePreparedRequest(1, 0, "STMT0001", "CRSR0001", nil, nil, true, true, nil)
 	if err != nil {
 		t.Fatalf("buildOpenDescribePreparedRequest() error = %v", err)
 	}

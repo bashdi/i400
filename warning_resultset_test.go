@@ -181,10 +181,6 @@ func TestQueryRowsNextResultSet(t *testing.T) {
 			t.Errorf("reuse indicator = %v, want %x", reusePayload, cursorReuseResultSet)
 			return
 		}
-		if _, err := server.Write(buildTestReplyPacket(nil)); err != nil {
-			t.Errorf("write close reply: %v", err)
-			return
-		}
 
 		packet, err = readPacket(server)
 		if err != nil {
@@ -258,6 +254,10 @@ func TestQueryContextCallNextResultSet(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()
 	defer server.Close()
+	client.SetDeadline(time.Now().Add(10 * time.Second))
+	server.SetDeadline(time.Now().Add(10 * time.Second))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
 	done := make(chan struct{})
 	go func() {
@@ -292,6 +292,26 @@ func TestQueryContextCallNextResultSet(t *testing.T) {
 		}
 		if _, err := server.Write(buildTestReplyPacket(buildTestSQLCAPayload(t, 0, "", 0))); err != nil {
 			t.Errorf("write prepare reply: %v", err)
+			return
+		}
+
+		// JTOpen executes the CALL before opening its result sets.
+		packet, err = readPacket(server)
+		if err != nil {
+			t.Errorf("read execute request: %v", err)
+			return
+		}
+		header, err = ParseHeader(packet[4:])
+		if err != nil {
+			t.Errorf("parse execute request header: %v", err)
+			return
+		}
+		if header.ReqRepID != FunctionExecute {
+			t.Errorf("execute request id = 0x%x, want 0x%x", header.ReqRepID, FunctionExecute)
+			return
+		}
+		if _, err := server.Write(buildTestReplyPacket(buildTestSQLCAPayload(t, 0, "", 2))); err != nil {
+			t.Errorf("write execute reply: %v", err)
 			return
 		}
 
@@ -338,10 +358,6 @@ func TestQueryContextCallNextResultSet(t *testing.T) {
 			t.Errorf("reuse indicator = %v, want %x", reusePayload, cursorReuseResultSet)
 			return
 		}
-		if _, err := server.Write(buildTestReplyPacket(nil)); err != nil {
-			t.Errorf("write close reply: %v", err)
-			return
-		}
 
 		packet, err = readPacket(server)
 		if err != nil {
@@ -365,7 +381,7 @@ func TestQueryContextCallNextResultSet(t *testing.T) {
 	}()
 
 	conn := &Conn{netConn: client, autoCommit: true}
-	rowsValue, err := conn.queryContext(context.Background(), "CALL QSYS2.DUMMY()", nil)
+	rowsValue, err := conn.queryContext(ctx, "CALL QSYS2.DUMMY()", nil)
 	if err != nil {
 		t.Fatalf("queryContext() error = %v", err)
 	}
@@ -479,8 +495,8 @@ func TestPreparedQueryUsesPreparedStatement(t *testing.T) {
 			t.Errorf("parse prepared statement close request header: %v", err)
 			return
 		}
-		if header.ReqRepID != FunctionClose {
-			t.Errorf("prepared statement close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionClose)
+		if header.ReqRepID != FunctionDeleteRPB {
+			t.Errorf("prepared statement close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionDeleteRPB)
 			return
 		}
 		if _, err := server.Write(buildTestReplyPacket(nil)); err != nil {
@@ -662,8 +678,8 @@ func TestPreparedQueryWithArgsUsesPreparedBind(t *testing.T) {
 			t.Errorf("parse prepared statement close request header: %v", err)
 			return
 		}
-		if header.ReqRepID != FunctionClose {
-			t.Errorf("prepared statement close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionClose)
+		if header.ReqRepID != FunctionDeleteRPB {
+			t.Errorf("prepared statement close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionDeleteRPB)
 			return
 		}
 		if _, err := server.Write(buildTestReplyPacket(nil)); err != nil {
@@ -819,8 +835,8 @@ func TestPreparedExecWithArgsUsesPreparedBind(t *testing.T) {
 			t.Errorf("parse prepared statement close request header: %v", err)
 			return
 		}
-		if header.ReqRepID != FunctionClose {
-			t.Errorf("prepared statement close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionClose)
+		if header.ReqRepID != FunctionDeleteRPB {
+			t.Errorf("prepared statement close request id = 0x%x, want 0x%x", header.ReqRepID, FunctionDeleteRPB)
 			return
 		}
 		if _, err := server.Write(buildTestReplyPacket(nil)); err != nil {

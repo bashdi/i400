@@ -4,30 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"net/url"
-	"strings"
 	"testing"
 	"time"
 )
 
-const (
-	databaseSQLCRUDTestHost     = "pub400.com"
-	databaseSQLCRUDTestUser     = "test"
-	databaseSQLCRUDTestPassword = "test"
-)
-
+// TestDatabaseSQLCRUD runs against a live IBM i system. The DSN comes from the
+// I400_TEST_DSN environment variable; the test is skipped when it is unset or
+// when -short is given. Tables are created in QTEMP.
 func TestDatabaseSQLCRUD(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping IBM i integration test in short mode")
-	}
-	if databaseSQLCRUDTestHasPlaceholders() {
-		t.Skip("replace the IBM i placeholder credentials in database_sql_crud_test.go before running this test")
-	}
+	dsn := integrationDSN(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	db, err := sql.Open("i400", databaseSQLCRUDTestDSN())
+	db, err := sql.Open("i400", dsn)
 	if err != nil {
 		t.Fatalf("sql.Open() error = %v", err)
 	}
@@ -109,24 +99,4 @@ func TestDatabaseSQLCRUD(t *testing.T) {
 	if deletedRows != 1 {
 		t.Fatalf("DELETE RowsAffected() = %d, want 1", deletedRows)
 	}
-}
-
-func databaseSQLCRUDTestDSN() string {
-	query := url.Values{}
-	query.Set("naming", string(NamingSQL))
-
-	dsn := &url.URL{
-		Scheme:   "as400",
-		Host:     databaseSQLCRUDTestHost,
-		Path:     "/QTEMP",
-		RawQuery: query.Encode(),
-		User:     url.UserPassword(databaseSQLCRUDTestUser, databaseSQLCRUDTestPassword),
-	}
-	return dsn.String()
-}
-
-func databaseSQLCRUDTestHasPlaceholders() bool {
-	return strings.HasPrefix(databaseSQLCRUDTestHost, "YOUR_") ||
-		strings.HasPrefix(databaseSQLCRUDTestUser, "YOUR_") ||
-		strings.HasPrefix(databaseSQLCRUDTestPassword, "YOUR_")
 }

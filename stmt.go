@@ -61,12 +61,13 @@ func (s *Stmt) Close() error {
 	}
 	conn := s.conn
 	statementName := s.statementName
+	statementHandle := s.statementHandle
 	s.mu.Unlock()
 
 	if conn == nil || statementName == "" || !conn.IsValid() {
 		return nil
 	}
-	return conn.closePreparedStatement(context.Background(), statementName)
+	return conn.closePreparedStatement(context.Background(), statementName, statementHandle)
 }
 
 func (s *Stmt) acquire() error {
@@ -135,6 +136,9 @@ func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 		s.release()
 		return nil, driver.ErrBadConn
 	}
+	if s.conn.cfg.ReturnGeneratedKeys && len(s.paramNames) == 0 && isInsertStatement(s.query) {
+		return s.conn.execInsertWithGeneratedKey(ctx, s.query, args)
+	}
 	if s.statementName != "" && s.parameterMarkerFormat != nil {
 		ordered, err := reorderNamedArgs(s.paramNames, args)
 		if err != nil {
@@ -160,11 +164,18 @@ func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 		return nil, driver.ErrBadConn
 	}
 	if s.statementName != "" && len(args) == 0 {
-		rows, err := s.conn.queryPrepared(ctx, s.statementHandle, s.statementName)
+		var rows driver.Rows
+		var err error
+		if s.statementType == sqlStatementTypeCall {
+			rows, err = s.conn.queryCallRows(ctx, s.statementHandle, s.statementName)
+		} else {
+			rows, err = s.conn.queryPrepared(ctx, s.statementHandle, s.statementName)
+		}
 		if err != nil {
 			s.release()
 			return nil, err
 		}
+		markStoredProcResult(rows, s.statementType)
 		if preparedRows, ok := rows.(*queryRows); ok {
 			preparedRows.releaseStmt = s.release
 			return rows, nil
@@ -182,6 +193,7 @@ func (s *Stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driv
 			s.release()
 			return nil, err
 		}
+		markStoredProcResult(rows, s.statementType)
 		if preparedRows, ok := rows.(*queryRows); ok {
 			preparedRows.releaseStmt = s.release
 			return rows, nil
