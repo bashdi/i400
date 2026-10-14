@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bashdi/i400/internal/ccsid"
@@ -457,7 +458,9 @@ func (c *Conn) releaseStatementHandle(handle uint16) {
 // discardStatement drops a statement whose prepare failed: its RPB already
 // exists on the server, so it is deleted and the id is released.
 func (c *Conn) discardStatement(ctx context.Context, statementName string, statementHandle uint16) {
-	_ = c.closePreparedStatement(ctx, statementName, statementHandle)
+	cleanupCtx, release := cleanupContext(ctx)
+	defer release()
+	_ = c.closePreparedStatement(cleanupCtx, statementName, statementHandle)
 }
 
 // nextDescriptorHandle cycles through 1..65535. Descriptors are deleted after
@@ -511,10 +514,59 @@ func (c *Conn) releaseDefaultCursor(statementHandle uint16) {
 }
 
 // releaseOpenCursorName undoes openCursorName when the open did not produce rows.
+// closeInterruptedCursor closes the cursor of an open that a deadline or
+// cancel interrupted. The native cancel ends the running statement but leaves
+// its cursor open on the server, so the statement stays in use (SQL0519 on
+// the next prepare of the same name) until the cursor is closed, as JTOpen
+// does when it closes the statement. Errors are ignored: the cursor may not
+// have been opened at all.
+func (c *Conn) closeInterruptedCursor(ctx context.Context, cursorName string, openErr error) {
+	if c == nil || !c.IsValid() {
+		return
+	}
+	if !errors.Is(openErr, context.DeadlineExceeded) && !errors.Is(openErr, context.Canceled) {
+		return
+	}
+	cleanupCtx, release := cleanupContext(ctx)
+	defer release()
+	_ = c.closeCursor(cleanupCtx, cursorName, cursorReuseNo)
+}
+
 func (c *Conn) releaseOpenCursorName(statementHandle uint16, defaultCursor bool) {
 	if defaultCursor {
 		c.releaseDefaultCursor(statementHandle)
 	}
+}
+
+// ctxIOError returns the context error that explains a failed read or write
+// on a connection whose I/O deadline was taken from ctx. That deadline and the
+// context's own timer fire at the same moment, so a read can fail before
+// ctx.Err() reports the expiry; a passed deadline is then context.DeadlineExceeded.
+// Without this the caller would get driver.ErrBadConn, which database/sql retries.
+func ctxIOError(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
+// cleanupContext returns the context for the requests that release a statement
+// or cursor after its own context has finished. doRequest invalidates the
+// connection when given a finished context, so a cancelled or expired statement
+// would otherwise lose its connection on Close even though native cancel kept
+// it usable. A finished ctx is therefore replaced by a fresh one bounded by
+// nativeCancelTimeout. The returned cancel func must be called.
+func cleanupContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.Background(), func() {}
+	}
+	if ctx.Err() == nil {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.Background(), nativeCancelTimeout)
 }
 
 func (c *Conn) doRequest(ctx context.Context, request []byte) (replyEnvelope, []byte, error) {
@@ -555,7 +607,7 @@ func (c *Conn) doRequestWithPreamble(ctx context.Context, preamble []byte, reque
 
 	if len(preamble) > 0 {
 		if _, err := conn.Write(preamble); err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
+			if ctxErr := ctxIOError(ctx); ctxErr != nil {
 				c.invalidateConnection(ctxErr)
 				return replyEnvelope{}, nil, ctxErr
 			}
@@ -564,7 +616,7 @@ func (c *Conn) doRequestWithPreamble(ctx context.Context, preamble []byte, reque
 		}
 	}
 	if _, err := conn.Write(request); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := ctxIOError(ctx); ctxErr != nil {
 			c.invalidateConnection(ctxErr)
 			return replyEnvelope{}, nil, ctxErr
 		}
@@ -573,7 +625,7 @@ func (c *Conn) doRequestWithPreamble(ctx context.Context, preamble []byte, reque
 	}
 	packet, err := readPacket(conn)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := ctxIOError(ctx); ctxErr != nil {
 			c.invalidateConnection(ctxErr)
 			return replyEnvelope{}, nil, ctxErr
 		}
@@ -617,18 +669,35 @@ func (c *Conn) canCancelNatively() bool {
 		strings.TrimSpace(c.systemInfo.ServerJobIdentifier) != ""
 }
 
+// nativeCancelGracePeriod bounds how long doStatementRequest keeps waiting for
+// the server's reply after a native cancel was sent for an expired context.
+// IBM i answers the interrupted request promptly (SQL -952 or a normal
+// completion), so the grace period only matters when the server never answers;
+// then the connection is dropped. JTOpen has no equivalent bound and waits
+// for the reply.
+var nativeCancelGracePeriod = 30 * time.Second
+
+// nativeCancelTimeout bounds one native cancel: connecting the cancel
+// connection, sending the cancel request and reading its reply.
+var nativeCancelTimeout = 10 * time.Second
+
 // doStatementRequest sends a database request for a long-running statement
 // operation (Execute, OpenDescribe, Fetch) and supports protocol-native context
 // cancellation when canCancelNatively() returns true.
 //
-// When native cancel is available and the context is cancelled, a cancel request
-// is sent to IBM i on a second connection while this connection waits for the
-// server's reply. IBM i aborts the statement and returns an error reply on the
-// main connection; the main connection is NOT invalidated and remains usable.
+// When native cancel is available, the socket is not given the context
+// deadline. When ctx is done (cancelled or deadline expired), a cancel request
+// is sent on a second connection while this connection keeps waiting for the
+// pending reply. If that reply arrives (SQL -952 or a normal completion), it is
+// consumed, the connection stays valid and ctx.Err() is returned. If the cancel
+// fails, or no reply arrives within nativeCancelGracePeriod, the connection is
+// invalidated and ctx.Err() is returned. Either way the error is ctx.Err(),
+// never driver.ErrBadConn: database/sql would retry a statement on another
+// connection and execute it twice.
 //
-// When native cancel is not available or the cancel connection fails, the function
-// falls back to deadline-based interruption (same behaviour as doRequest), which
-// invalidates the connection.
+// When native cancel is not available, the function delegates to doRequest,
+// where the context deadline is the socket deadline and expiry invalidates the
+// connection, still reporting ctx.Err().
 func (c *Conn) doStatementRequest(ctx context.Context, request []byte, statementHandle uint16) (replyEnvelope, []byte, error) {
 	if !c.canCancelNatively() {
 		return c.doRequest(ctx, request)
@@ -650,68 +719,78 @@ func (c *Conn) doStatementRequest(ctx context.Context, request []byte, statement
 	c.opMu.Lock()
 	defer c.opMu.Unlock()
 
-	setConnDeadline(conn, ctx)
+	// No socket deadline from ctx: a read deadline equal to the context deadline
+	// would fail the read before the native cancel reply can be consumed.
+	clearConnDeadline(conn)
 	defer clearConnDeadline(conn)
 
-	// connInUse is closed when this function returns. The AfterFunc goroutine
-	// checks it before killing the deadline as a fallback, to avoid disturbing
-	// the connection after doStatementRequest has already returned.
-	connInUse := make(chan struct{})
-	defer close(connInUse)
-
-	cancelStop := context.AfterFunc(ctx, func() {
-		if err := c.cancelStatement(context.Background(), statementHandle); err == nil {
-			// Native cancel sent. IBM i will send an error reply on the main
-			// connection; leave the deadline alone so we can read it cleanly.
+	// The watcher owns the socket deadline only while the request is pending.
+	// finished is set under watchMu before this function returns, so the watcher
+	// never changes the deadline of a connection that has already been handed back.
+	var (
+		watchMu  sync.Mutex
+		finished bool
+	)
+	stop := make(chan struct{})
+	defer func() {
+		watchMu.Lock()
+		finished = true
+		watchMu.Unlock()
+		close(stop)
+	}()
+	go func() {
+		select {
+		case <-stop:
+			return
+		case <-ctx.Done():
+		}
+		cancelErr := c.cancelStatement(context.Background(), statementHandle)
+		watchMu.Lock()
+		defer watchMu.Unlock()
+		if finished {
 			return
 		}
-		// Native cancel failed; fall back to deadline kill only if this function
-		// is still blocking on I/O.
-		select {
-		case <-connInUse:
-			// doStatementRequest already returned; don't touch the connection.
-		default:
-			_ = conn.SetDeadline(time.Now())
+		if cancelErr == nil {
+			// Native cancel accepted: wait a bounded time for the reply.
+			_ = conn.SetDeadline(time.Now().Add(nativeCancelGracePeriod))
+			return
 		}
-	})
-	defer cancelStop()
+		// Native cancel failed: the reply will not come in a usable form, so
+		// make the pending read fail at once.
+		_ = conn.SetDeadline(time.Now())
+	}()
 
 	if _, err := conn.Write(request); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			c.invalidateConnection(ctxErr)
-			return replyEnvelope{}, nil, ctxErr
-		}
-		c.invalidateConnection(driver.ErrBadConn)
-		return replyEnvelope{}, nil, driver.ErrBadConn
+		return c.abortStatementIO(ctx)
 	}
-
 	packet, err := readPacket(conn)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			// If native cancel fired and succeeded, we would have received an
-			// IBM i error packet (not an I/O error). So we got here because the
-			// fallback deadline fired; the connection is no longer usable.
-			c.invalidateConnection(ctxErr)
-			return replyEnvelope{}, nil, ctxErr
-		}
-		c.invalidateConnection(driver.ErrBadConn)
-		return replyEnvelope{}, nil, driver.ErrBadConn
+		return c.abortStatementIO(ctx)
 	}
-
 	env, payload, err := readReplyEnvelope(packet)
 	if err != nil {
-		c.invalidateConnection(driver.ErrBadConn)
-		return replyEnvelope{}, nil, driver.ErrBadConn
+		return c.abortStatementIO(ctx)
 	}
 
-	// If context was cancelled and IBM i sent a cancel-acknowledgement reply,
-	// translate to context.Canceled without invalidating the connection — it is
-	// still in a clean state and reusable for subsequent statements.
+	// A reply that arrived after ctx was done (the native cancel's -952, or a
+	// reply that raced with the expiry) is consumed; the connection stays valid.
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return replyEnvelope{}, nil, ctxErr
 	}
-
 	return env, payload, nil
+}
+
+// abortStatementIO handles a failed write or read in doStatementRequest. A
+// context that is done (or whose deadline has passed) explains the failure and
+// the connection is invalidated; the error returned is always the context error.
+// Otherwise it is a genuine I/O failure and driver.ErrBadConn is returned.
+func (c *Conn) abortStatementIO(ctx context.Context) (replyEnvelope, []byte, error) {
+	if ctxErr := ctxIOError(ctx); ctxErr != nil {
+		c.invalidateConnection(ctxErr)
+		return replyEnvelope{}, nil, ctxErr
+	}
+	c.invalidateConnection(driver.ErrBadConn)
+	return replyEnvelope{}, nil, driver.ErrBadConn
 }
 
 func (c *Conn) queryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -977,6 +1056,7 @@ func (c *Conn) queryRowsForStatement(ctx context.Context, statementHandle uint16
 
 	meta, sqlca, err := c.openAndDescribe(ctx, statementHandle, statementName, cursorName, 0, nil, nil)
 	if err != nil {
+		c.closeInterruptedCursor(ctx, cursorName, err)
 		c.releaseOpenCursorName(statementHandle, defaultCursor)
 		return nil, err
 	}
@@ -1073,6 +1153,7 @@ func (c *Conn) queryRowsForStatementWithBindings(ctx context.Context, statementH
 	cursorName, defaultCursor := c.openCursorName(statementHandle)
 	meta, sqlca, err := c.openAndDescribe(ctx, statementHandle, statementName, cursorName, descriptorHandle, format, bindings)
 	if err != nil {
+		c.closeInterruptedCursor(ctx, cursorName, err)
 		c.releaseOpenCursorName(statementHandle, defaultCursor)
 		return nil, err
 	}
@@ -1419,7 +1500,8 @@ func (r *queryRows) scroll(option, relative int) error {
 	case fetchBeforeFirst:
 		r.currentRow = 0
 	case fetchAfterLast:
-		r.currentRow = -1
+		// JTOpen getRow returns 0 when positioned after the last row.
+		r.currentRow = 0
 	case fetchFirst:
 		r.currentRow = 0
 	case fetchDirect:
@@ -1479,7 +1561,10 @@ func (r *queryRows) NextResultSet() error {
 	// request that gets no reply, before the next result set is opened. A
 	// cursor the server already closed (code 700) needs no close.
 	if !r.serverClosed && strings.TrimSpace(r.cursorName) != "" {
-		if err := r.conn.closeResultSetCursorNoReply(r.ctx, r.statementHandle, r.cursorName, cursorReuseResultSet); err != nil {
+		ctx, releaseCtx := cleanupContext(r.ctx)
+		err := r.conn.closeResultSetCursorNoReply(ctx, r.statementHandle, r.cursorName, cursorReuseResultSet)
+		releaseCtx()
+		if err != nil {
 			r.closed = true
 			return err
 		}
@@ -1512,6 +1597,8 @@ func (r *queryRows) Close() error {
 	}
 	r.closed = true
 	var closeErr error
+	ctx, releaseCtx := cleanupContext(r.ctx)
+	defer releaseCtx()
 	if r.conn != nil {
 		if r.defaultCursor {
 			defer r.conn.releaseDefaultCursor(r.statementHandle)
@@ -1521,15 +1608,15 @@ func (r *queryRows) Close() error {
 			// The server closed the cursor at end of data (code 700).
 		case r.endOfData && strings.TrimSpace(r.cursorName) != "":
 			// Last block (code 701): JTOpen closes the cursor without a reply.
-			closeErr = r.conn.closeResultSetCursorNoReply(r.ctx, r.statementHandle, r.cursorName, cursorReuseYes)
+			closeErr = r.conn.closeResultSetCursorNoReply(ctx, r.statementHandle, r.cursorName, cursorReuseYes)
 		default:
-			closeErr = r.conn.closeCursor(r.ctx, r.cursorName, cursorReuseYes)
+			closeErr = r.conn.closeCursor(ctx, r.cursorName, cursorReuseYes)
 		}
 		if r.ownStatement && strings.TrimSpace(r.statementName) != "" {
 			// Ignore the error: the statement's RPB is deleted as JTOpen does
 			// when a statement closes (a close by statement name is not
 			// supported by IBM i, class=2 code=-103).
-			_ = r.conn.closePreparedStatement(r.ctx, r.statementName, r.statementHandle)
+			_ = r.conn.closePreparedStatement(ctx, r.statementName, r.statementHandle)
 		}
 	}
 	if r.releaseStmt != nil {
@@ -1968,7 +2055,13 @@ func parseExtendedColumnDescriptors(payload []byte, meta *resultSetMeta) error {
 		meta.columns[i].IsNamed = attributeBitmap&0x0100 == 0
 		meta.columns[i].IsRowID = attributeBitmap&0x0080 != 0
 		meta.columns[i].IsRowChangeTimestamp = attributeBitmap&0x0040 != 0
-		offsets[i] = int(offset)
+		// JTOpen DBExtendedColumnDescriptors reads the sections at (offset_ - 6) + offset,
+		// where offset_ is the payload start, so offsets count from the 6-byte LL/CP
+		// header in front of the payload.
+		if offset < 6 {
+			return fmt.Errorf("invalid extended column descriptor offset: %d", offset)
+		}
+		offsets[i] = int(offset) - 6
 		lengths[i] = int(length)
 	}
 
@@ -3050,8 +3143,17 @@ func decodeZonedDecimalString(data []byte, precision, scale int) (string, error)
 	digits := make([]byte, 0, len(data))
 	sign := byte(0x0C)
 	for i, b := range data {
+		// As in JTOpen AS400ZonedDecimal.toObject: the low nibble of every byte
+		// must be a digit, and the high nibble of the last byte must be a sign
+		// (A-F). Only B and D are negative.
+		if b&0x0F > 0x09 {
+			return "", fmt.Errorf("invalid zoned decimal digit nibble 0x%X", b&0x0F)
+		}
 		if i == len(data)-1 {
 			sign = (b >> 4) & 0x0F
+			if sign < 0x0A {
+				return "", fmt.Errorf("invalid zoned decimal sign nibble 0x%X", sign)
+			}
 		}
 		digits = append(digits, '0'+(b&0x0F))
 	}
@@ -3077,7 +3179,7 @@ func decodeZonedDecimalString(data []byte, precision, scale int) (string, error)
 		digits = append(digits[:point], append([]byte{'.'}, digits[point:]...)...)
 	}
 	prefix := ""
-	if sign == 0x0D {
+	if sign == 0x0B || sign == 0x0D {
 		prefix = "-"
 	}
 	return prefix + string(digits), nil
@@ -3298,7 +3400,9 @@ func parameterFieldValueString(value driver.Value) (string, error) {
 		}
 		return "0", nil
 	case time.Time:
-		return v.Format("2006-01-02T15:04:05.999999999"), nil
+		// JTOpen binds a Timestamp to character columns as yyyy-mm-dd-hh.mm.ss[.f]
+		// (SQLVarcharBase.set, timestampToStringTrimTrailingZeros).
+		return v.Format("2006-01-02-15.04.05.999999999"), nil
 	default:
 		return fmt.Sprint(v), nil
 	}

@@ -91,6 +91,17 @@ func (c *Connector) Driver() driver.Driver {
 }
 
 func openConn(ctx context.Context, cfg Config) (*Conn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// connectTimeout bounds the whole open (signon, database start and server
+	// attributes), not only the TCP dial. Without this a host that accepts the
+	// connection and never answers would block Driver.Open forever.
+	if cfg.ConnectTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.ConnectTimeout)
+		defer cancel()
+	}
 	info, err := connectSystemInfo(ctx, cfg, cfg.User, cfg.Password)
 	if err != nil {
 		return nil, err

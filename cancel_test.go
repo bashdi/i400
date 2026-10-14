@@ -6,17 +6,17 @@ import (
 )
 
 func TestParseServerAttributesBlockExtractsJobIdentifier(t *testing.T) {
-	data := make([]byte, 114)
+	data := make([]byte, 116)
 	functionalLevel, err := EncodeEBCDIC37("V7R2M05   ")
 	if err != nil {
 		t.Fatalf("EncodeEBCDIC37() error = %v", err)
 	}
-	copy(data[50:60], functionalLevel)
+	copy(data[52:62], functionalLevel)
 	jobIdentifier, err := EncodeEBCDIC37("QSQSRVR   123456USER      ")
 	if err != nil {
 		t.Fatalf("EncodeEBCDIC37() error = %v", err)
 	}
-	copy(data[88:114], jobIdentifier)
+	copy(data[90:116], jobIdentifier)
 
 	info := &SystemInfo{}
 	if err := parseServerAttributesBlock(data, info); err != nil {

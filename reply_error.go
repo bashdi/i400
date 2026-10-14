@@ -28,7 +28,7 @@ import (
 // statement the request was for, or 0 for a connection-level request.
 func (c *Conn) checkReply(ctx context.Context, statementHandle uint16, operation string, envelope replyEnvelope, payload []byte) error {
 	if envelope.hasWarning() {
-		if !(envelope.RCClass == 2 && envelope.RCCode == 700) {
+		if !isEndOfDataReply(operation, envelope) {
 			c.recordWarning(&SQLWarning{
 				Code:    envelope.RCCode,
 				Message: fmt.Sprintf("%s returned warning: class=%d code=%d", operation, envelope.RCClass, envelope.RCCode),
@@ -49,6 +49,24 @@ func (c *Conn) checkReply(ctx context.Context, statementHandle uint16, operation
 	// JTOpen uses the reply return code as the SQLCODE.
 	info.SQLCode = envelope.RCCode
 	return c.newSQLError(ctx, statementHandle, info)
+}
+
+// isEndOfDataReply reports the return codes that JTOpen's JDServerRowCache
+// treats as end of data on a fetch rather than as warnings: class 1 / 100 and
+// class 2 / 701 (last block), and class 2 / 700 (cursor already closed by the
+// server). Class 2 / 700 is excluded for every operation, as before.
+func isEndOfDataReply(operation string, envelope replyEnvelope) bool {
+	switch {
+	case envelope.RCClass == 2 && envelope.RCCode == 700:
+		return true
+	case operation != "fetch":
+		return false
+	case envelope.RCClass == 1 && envelope.RCCode == 100:
+		return true
+	case envelope.RCClass == 2 && envelope.RCCode == 701:
+		return true
+	}
+	return false
 }
 
 // payloadHasSQLCA reports whether a reply payload carries an SQLCA

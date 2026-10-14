@@ -74,3 +74,25 @@ func TestCheckReplyCursorClosedIsNotWarning(t *testing.T) {
 		t.Fatalf("lastWarning = %+v, want none", c.lastWarning)
 	}
 }
+
+// TestCheckReplyFetchEndOfDataIsNotWarning mirrors JTOpen's JDServerRowCache:
+// on a fetch, class 1 / 100 and class 2 / 701 mean end of data, not a warning.
+// The same codes from another operation are still warnings.
+func TestCheckReplyFetchEndOfDataIsNotWarning(t *testing.T) {
+	for _, env := range []replyEnvelope{{RCClass: 1, RCCode: 100}, {RCClass: 2, RCCode: 701}} {
+		c := &Conn{}
+		if err := c.checkReply(context.Background(), 0, "fetch", env, nil); err != nil {
+			t.Fatalf("fetch %d/%d: error = %v, want nil", env.RCClass, env.RCCode, err)
+		}
+		if c.lastWarning != nil {
+			t.Fatalf("fetch %d/%d: lastWarning = %+v, want none", env.RCClass, env.RCCode, c.lastWarning)
+		}
+		c = &Conn{}
+		if err := c.checkReply(context.Background(), 0, "execute", env, nil); err != nil {
+			t.Fatalf("execute %d/%d: error = %v, want nil", env.RCClass, env.RCCode, err)
+		}
+		if c.lastWarning == nil {
+			t.Fatalf("execute %d/%d: want a recorded warning", env.RCClass, env.RCCode)
+		}
+	}
+}

@@ -246,7 +246,7 @@ Names are case-sensitive, as in JTOpen: `ApplicationName`, `ClientUser`, `Client
 
 ### Query timeouts
 
-`database/sql` has no query-timeout method; use a context deadline (`context.WithTimeout`) with `QueryContext` or `ExecContext`. When the deadline expires, the driver cancels the running statement with the host server's native cancel request and returns `context.DeadlineExceeded`. If native cancel is not available, the connection is invalidated instead.
+`database/sql` has no query-timeout method; use a context deadline (`context.WithTimeout`) with `QueryContext` or `ExecContext`. When the deadline expires, the driver cancels the running statement with the host server's native cancel request (sent over a second connection, as JTOpen does) and returns `context.DeadlineExceeded`. The connection stays usable: the driver reads the server's reply to the interrupted statement (usually SQL0952) and closes its cursor. If the server does not answer within 30 seconds after the cancel, or native cancel is not available, the connection is invalidated instead. A deadline never returns `driver.ErrBadConn`, so `database/sql` does not retry the statement on another connection.
 
 With `queryTimeoutMechanism=qqrytimlmt` the driver also sends the remaining time (whole seconds, at least 1) to the server before each open or execute, as JTOpen does. This is the IBM i query time limit (QQRYTIMLMT): the server compares the optimizer's estimated run time with the limit before running the query and rejects it with SQL0666 if it is over. It does not stop a query that is already running.
 

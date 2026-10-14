@@ -52,6 +52,9 @@ func connectDatabase(ctx context.Context, cfg Config, info *SystemInfo, user, pa
 	serverSeed, err := databaseExchangeSeeds(conn, clientSeed)
 	if err != nil {
 		conn.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, "", ctxErr
+		}
 		return nil, "", err
 	}
 
@@ -229,12 +232,21 @@ func parseServerAttributesPayload(payload []byte, info *SystemInfo) error {
 	return nil
 }
 
+// Offsets of the server attributes fields within the 0x3804 payload, after its
+// 6-byte LLCP header. JTOpen (DBBaseReplyDS passes offset + 8 of the element to
+// DBReplyServerAttributes, which reads the functional level at +50 and the job
+// identifier at +88) therefore reads them 2 bytes further into this payload.
+const (
+	serverAttributesFunctionalLevelOffset = 52
+	serverAttributesJobIdentifierOffset   = 90
+)
+
 func parseServerAttributesBlock(data []byte, info *SystemInfo) error {
-	if len(data) < 114 {
+	if len(data) < serverAttributesJobIdentifierOffset+26 {
 		return fmt.Errorf("server attributes too short: %d", len(data))
 	}
 
-	if functionalLevel, err := DecodeEBCDIC37(data[50:60]); err == nil {
+	if functionalLevel, err := DecodeEBCDIC37(data[serverAttributesFunctionalLevelOffset : serverAttributesFunctionalLevelOffset+10]); err == nil {
 		trimmed := strings.TrimSpace(functionalLevel)
 		if len(trimmed) >= 7 {
 			if parsed, err := strconv.Atoi(strings.TrimSpace(trimmed[6:])); err == nil {
@@ -243,7 +255,7 @@ func parseServerAttributesBlock(data []byte, info *SystemInfo) error {
 		}
 	}
 
-	if jobIdentifier, err := DecodeEBCDIC37(data[88:114]); err == nil {
+	if jobIdentifier, err := DecodeEBCDIC37(data[serverAttributesJobIdentifierOffset : serverAttributesJobIdentifierOffset+26]); err == nil {
 		info.ServerJobIdentifier = jobIdentifier
 	}
 
@@ -621,6 +633,8 @@ func encodeEBCDIC37Fixed(text string, size int) []byte {
 	return result
 }
 
+// cancelStatement asks IBM i to cancel the statement running in this
+// connection's server job, over a second connection (protocol-native cancel). The cancel is bounded by nativeCancelTimeout.
 func (c *Conn) cancelStatement(ctx context.Context, statementHandle uint16) error {
 	if c == nil {
 		return driver.ErrBadConn
@@ -634,6 +648,10 @@ func (c *Conn) cancelStatement(ctx context.Context, statementHandle uint16) erro
 	if c.systemInfo == nil || c.systemInfo.ServerFunctionalLevel < 5 || strings.TrimSpace(c.systemInfo.ServerJobIdentifier) == "" {
 		return unsupported("protocol-native cancel")
 	}
+	// Bound the whole cancel (connect, request, reply) even when ctx has no
+	// deadline, so a silent server cannot block the caller indefinitely.
+	ctx, cancelTimeout := context.WithTimeout(ctx, nativeCancelTimeout)
+	defer cancelTimeout()
 
 	cancelInfo := *c.systemInfo
 	cancelConn, _, err := connectDatabase(ctx, c.cfg, &cancelInfo, c.cfg.User, c.cfg.Password)
@@ -642,7 +660,13 @@ func (c *Conn) cancelStatement(ctx context.Context, statementHandle uint16) erro
 	}
 	defer cancelConn.Close()
 
-	request, err := buildCancelRequest(statementHandle, c.systemInfo.ServerJobIdentifier)
+	// JTOpen's AS400JDBCConnectionImpl.cancel(id) builds the request with the
+	// connection's own id_, which is never assigned and so always 0; the
+	// statement id is only traced. The server identifies the work to cancel by
+	// the job identifier and rejects a statement RPB id (class 7, -401), as
+	// seen on V7R5. statementHandle is therefore not sent.
+	_ = statementHandle
+	request, err := buildCancelRequest(0, c.systemInfo.ServerJobIdentifier)
 	if err != nil {
 		return err
 	}

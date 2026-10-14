@@ -133,7 +133,6 @@ func (s *Stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (drive
 	}
 	defer s.release()
 	if s.conn == nil || !s.conn.IsValid() {
-		s.release()
 		return nil, driver.ErrBadConn
 	}
 	if s.conn.cfg.ReturnGeneratedKeys && len(s.paramNames) == 0 && isInsertStatement(s.query) {
