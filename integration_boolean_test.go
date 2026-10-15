@@ -5,11 +5,16 @@ import (
 	"testing"
 )
 
+// booleanMinVRM is V7R5M0, the first release with the SQL BOOLEAN data type.
+const booleanMinVRM = 0x070500
+
 // TestIntegrationBoolean round-trips BOOLEAN values bound as bool, int64 and
-// string, and checks each stored value comes back exactly.
+// string, and checks each stored value comes back exactly. It skips on releases
+// before V7R5 because BOOLEAN does not exist there.
 func TestIntegrationBoolean(t *testing.T) {
 	lib := integrationLibrary(t)
 	db := openIntegrationDB(t, integrationDSN(t))
+	integrationSkipBelowVRM(t, db, booleanMinVRM, "BOOLEAN")
 	ctx := integrationContext(t)
 
 	table := integrationQualified(lib, integrationName("IBO"))

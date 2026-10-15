@@ -194,6 +194,36 @@ func createIntegrationTable(t *testing.T, db *sql.DB, qualified, columns string)
 		"DROP TABLE "+qualified)
 }
 
+// integrationSkipBelowVRM skips the test when the server reports a VRM older
+// than minVRM (JTOpen encoding: (version<<16)|(release<<8)|modification), for
+// features the release does not have. An unknown VRM (0) does not skip.
+func integrationSkipBelowVRM(t *testing.T, db *sql.DB, minVRM int, feature string) {
+	t.Helper()
+	ctx := integrationContext(t)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("db.Conn() error = %v", err)
+	}
+	defer conn.Close()
+
+	var vrm int
+	if err := conn.Raw(func(dc any) error {
+		c, ok := dc.(*Conn)
+		if !ok {
+			return fmt.Errorf("driver conn is %T, want *Conn", dc)
+		}
+		if c.systemInfo != nil {
+			vrm = c.systemInfo.ServerVersion
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("conn.Raw() error = %v", err)
+	}
+	if vrm != 0 && vrm < minVRM {
+		t.Skipf("%s needs a server VRM of %#x or later; the server reports %#x", feature, minVRM, vrm)
+	}
+}
+
 // sqlErrorFrom reports whether err is (or wraps) an *SQLError.
 func sqlErrorFrom(err error) (*SQLError, bool) {
 	var sqlErr *SQLError
